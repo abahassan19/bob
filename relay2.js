@@ -12,9 +12,8 @@ process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason.message);
 });
 
-// Create HTTP server first — required by Render for health checks + TLS termination
+// Create HTTP server for health checks - Render needs this
 const server = http.createServer((req, res) => {
-  // Health check endpoint — Render needs this to keep the service alive
   if (req.url === '/healthz' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
@@ -25,11 +24,11 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocket.Server({ server });
-wss.setMaxListeners(100); 
+wss.setMaxListeners(100);
 const proxies = new Map();
 const clients = new Map();
 const usage = {};
-const proxyUsage = {}; // NEW: per-proxy byte tracking
+const proxyUsage = {};
 const PIPE_TIMEOUT = 300000;
 
 console.log(`Relay on ${PORT}`);
@@ -68,7 +67,6 @@ wss.on('connection', (ws) => {
           return;
         }
 
-        // Auth check (from cache, no DB hit)
         if (!checkAccess(msg.accessCode)) {
           ws.send(JSON.stringify({ type: 'error', message: 'access code not authorized' }));
           console.log(`Auth denied: ${msg.accessCode}`);
@@ -165,7 +163,7 @@ wss.on('connection', (ws) => {
     if (ws.role === 'proxy') {
       proxies.delete(ws.proxyId);
       console.log(`Proxy offline: ${ws.proxyId}`);
-      delete proxyUsage[ws.proxyId]; // clean up
+      delete proxyUsage[ws.proxyId];
       saveProxyList();
     } else if (ws.role === 'client') {
       clients.delete(ws.clientId);
@@ -175,7 +173,6 @@ wss.on('connection', (ws) => {
 
 // Only DB writes happen here - once per minute
 setInterval(async () => {
-  // Auth sweep before syncing
   const invalid = [];
   for (const code of Object.keys(usage)) {
     if (usage[code] <= 0) continue;
@@ -188,7 +185,6 @@ setInterval(async () => {
     delete usage[code];
   }
 
-  // Batch sync everything to Supabase
   for (const [code, bytes] of Object.entries(usage)) {
     if (bytes > 0) {
       await syncUsage(code, bytes);
@@ -196,7 +192,6 @@ setInterval(async () => {
     }
   }
 
-  // NEW: Sync proxy usage
   for (const [proxyId, bytes] of Object.entries(proxyUsage)) {
     if (bytes > 0) {
       await syncProxyUsage(proxyId, bytes);
@@ -204,7 +199,6 @@ setInterval(async () => {
     }
   }
 
-  // Status log
   console.log(`\nProxies:${proxies.size} Clients:${clients.size}`);
   for (const [code, bytes] of Object.entries(usage)) {
     if (bytes > 0) console.log(`  ${code}: ${(bytes/1e6).toFixed(2)} MB`);
@@ -214,7 +208,6 @@ setInterval(async () => {
   }
 }, 60000);
 
-// Bind HTTP server (WebSocket attached to it) to PORT
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server listening on 0.0.0.0:${PORT}`);
+  console.log(`Relay HTTP+WS server listening on 0.0.0.0:${PORT}`);
 });
