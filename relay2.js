@@ -1,4 +1,4 @@
-// server.js
+// relay.js
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
@@ -24,7 +24,6 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocket.Server({ server });
-wss.setMaxListeners(100);
 const proxies = new Map();
 const clients = new Map();
 const usage = {};
@@ -91,7 +90,7 @@ wss.on('connection', (ws) => {
         const bridge = (proxyWs, clientWs, accessCode, proxyId) => {
           let bytes = 0;
           let alive = true;
-          const kill = () => { alive = false; };
+          let cleanupTimer = null;
 
           const proxyHandler = (data) => {
             if (!alive) return;
@@ -131,16 +130,21 @@ wss.on('connection', (ws) => {
           const cleanup = () => {
             if (!alive) return;
             alive = false;
+            if (cleanupTimer) { clearTimeout(cleanupTimer); cleanupTimer = null; }
             proxyWs.removeListener('message', proxyHandler);
+            proxyWs.removeListener('close', cleanup);
+            proxyWs.removeListener('error', cleanup);
             clientWs.removeListener('message', clientHandler);
+            clientWs.removeListener('close', cleanup);
+            clientWs.removeListener('error', cleanup);
             usage[accessCode] = (usage[accessCode] || 0) + bytes;
           };
 
-          clientWs.on('close', cleanup);
+          cleanupTimer = setTimeout(cleanup, PIPE_TIMEOUT);
           proxyWs.on('close', cleanup);
-          ws.on('close', cleanup);
-
-          setTimeout(cleanup, PIPE_TIMEOUT);
+          proxyWs.on('error', cleanup);
+          clientWs.on('close', cleanup);
+          clientWs.on('error', cleanup);
         };
 
         bridge(proxy, ws, msg.accessCode, msg.proxyId);
@@ -165,7 +169,9 @@ wss.on('connection', (ws) => {
       console.log(`Proxy offline: ${ws.proxyId}`);
       delete proxyUsage[ws.proxyId];
       saveProxyList();
-    } else if (ws.role === 'client') {
+    }
+    // Always clean up client map entry if one was set — catches partial setups
+    if (ws.clientId) {
       clients.delete(ws.clientId);
     }
   });
