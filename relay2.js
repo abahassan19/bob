@@ -44,6 +44,9 @@ function saveProxyList() {
 wss.on('connection', (ws) => {
   ws.on('error', () => {});
 
+
+  ws.on('ping', () => { ws.pong(); });
+
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
