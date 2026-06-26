@@ -13,11 +13,11 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const proxies = new Map();       // proxyId → { ws, connectedAt, lastSeen, ip, bytesRelayed }
-const clients = new Map();       // clientId → { ws, proxyId, accessCode, connectedAt, bytes }
-const usage = {};                // accessCode → accumulated bytes
-const proxyUsage = {};           // proxyId → accumulated bytes
-const activeBridges = new Map(); // bridgeId → bridge cleanup function
+const proxies = new Map();
+const clients = new Map();
+const usage = {};
+const proxyUsage = {};
+const activeBridges = new Map();
 const PIPE_TIMEOUT = 300000;
 let bridgeCounter = 0;
 
@@ -64,18 +64,13 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // ── Proxy list endpoint ──
   if (req.url === '/proxies') {
     const data = getProxyHealth();
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ 
-      total: Object.keys(data).length,
-      proxies: data 
-    }, null, 2));
+    res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }, null, 2));
     return;
   }
 
-  // ── Stats endpoint ──
   if (req.url === '/stats') {
     const proxyHealth = getProxyHealth();
     const usageSummary = {};
@@ -86,14 +81,8 @@ const server = http.createServer((req, res) => {
     for (const [id, bytes] of Object.entries(proxyUsage)) {
       if (bytes > 0) proxyUsageSummary[id] = (bytes / 1e6).toFixed(2) + ' MB';
     }
-    
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      proxies: proxyHealth,
-      clients: clients.size,
-      usage: usageSummary,
-      proxyUsage: proxyUsageSummary
-    }, null, 2));
+    res.end(JSON.stringify({ proxies: proxyHealth, clients: clients.size, usage: usageSummary, proxyUsage: proxyUsageSummary }, null, 2));
     return;
   }
 
@@ -104,16 +93,60 @@ const server = http.createServer((req, res) => {
 // ─── WebSocket Server ────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server });
 
+// ─── Bidirectional Heartbeat ─────────────────────────────────────────────────
+// Relay sends heartbeat to ALL connected websockets every 10s
+// If no response in 25s, connection is considered dead
+const HEARTBEAT_INTERVAL = 10000;
+const HEARTBEAT_TIMEOUT = 25000;
+
+const heartbeatInterval = setInterval(() => {
+  const now = Date.now();
+  
+  for (const [id, p] of proxies) {
+    const ws = p.ws;
+    if (!ws || ws.readyState !== WebSocket.OPEN) continue;
+    
+    // Check if we've missed too many heartbeats
+    if (now - p.lastSeen > HEARTBEAT_TIMEOUT) {
+      console.log(`Proxy ${id} heartbeat timeout (${Math.floor((now - p.lastSeen)/1000)}s), terminating`);
+      p.stale = true;
+      ws.terminate();
+      continue;
+    }
+    
+    // Send heartbeat ping
+    try {
+      ws.ping();
+    } catch (e) {}
+  }
+}, HEARTBEAT_INTERVAL);
+heartbeatInterval.unref();
+
 wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
-  ws.on('ping', () => { ws.pong(); });
+  ws.isAlive = true;
+  
+  // Respond to pings from proxy backends
+  ws.on('ping', () => { 
+    ws.pong();
+    if (ws.role === 'proxy' && ws.proxyId) {
+      updateProxySeen(ws.proxyId);
+    }
+  });
+  
+  // Track pong responses
+  ws.on('pong', () => {
+    ws.isAlive = true;
+    if (ws.role === 'proxy' && ws.proxyId) {
+      updateProxySeen(ws.proxyId);
+    }
+  });
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch (e) { return; }
 
     switch (msg.type) {
-      // ── Proxy Registration ──
       case 'register_proxy':
         ws.role = 'proxy';
         ws.proxyId = msg.proxyId;
@@ -124,7 +157,8 @@ wss.on('connection', (ws, req) => {
           lastSeen: Date.now(),
           ip: req.socket.remoteAddress || 'unknown',
           bytesRelayed: 0,
-          activeTunnels: 0
+          activeTunnels: 0,
+          stale: false
         });
         
         if (!proxyUsage[msg.proxyId]) proxyUsage[msg.proxyId] = 0;
@@ -133,7 +167,6 @@ wss.on('connection', (ws, req) => {
         saveProxyList();
         break;
 
-      // ── Client Connect ──
       case 'connect': {
         const proxyEntry = proxies.get(msg.proxyId);
         if (!proxyEntry || !proxyEntry.ws || proxyEntry.ws.readyState !== WebSocket.OPEN) {
@@ -153,15 +186,8 @@ wss.on('connection', (ws, req) => {
         ws.proxyId = msg.proxyId;
 
         if (!usage[msg.accessCode]) usage[msg.accessCode] = 0;
-        clients.set(msg.clientId, {
-          ws,
-          proxyId: msg.proxyId,
-          accessCode: msg.accessCode,
-          connectedAt: Date.now(),
-          bytes: 0
-        });
+        clients.set(msg.clientId, { ws, proxyId: msg.proxyId, accessCode: msg.accessCode, connectedAt: Date.now(), bytes: 0 });
 
-        // Increment active tunnel count on proxy
         proxyEntry.activeTunnels = (proxyEntry.activeTunnels || 0) + 1;
 
         const proxyWs = proxyEntry.ws;
@@ -179,7 +205,6 @@ wss.on('connection', (ws, req) => {
           accessCode: msg.accessCode
         }));
 
-        // ── Bridge Logic ──
         let bytes = 0;
         let alive = true;
         let cleanupTimer = null;
@@ -212,15 +237,9 @@ wss.on('connection', (ws, req) => {
             bytes += len;
             proxyUsage[proxyId] = (proxyUsage[proxyId] || 0) + len;
             const pEntry = proxies.get(proxyId);
-            if (pEntry) {
-              pEntry.bytesRelayed = (pEntry.bytesRelayed || 0) + len;
-            }
+            if (pEntry) pEntry.bytesRelayed = (pEntry.bytesRelayed || 0) + len;
             if (proxyWs.readyState === WebSocket.OPEN) {
-              proxyWs.send(JSON.stringify({
-                type: 'pipe_data',
-                clientId: clientId,
-                data: m.data
-              }));
+              proxyWs.send(JSON.stringify({ type: 'pipe_data', clientId: clientId, data: m.data }));
             }
           }
         };
@@ -242,7 +261,6 @@ wss.on('connection', (ws, req) => {
           
           usage[accessCode] = (usage[accessCode] || 0) + bytes;
           
-          // Decrement active tunnel count
           const pEntry = proxies.get(proxyId);
           if (pEntry && pEntry.activeTunnels > 0) {
             pEntry.activeTunnels--;
@@ -265,17 +283,15 @@ wss.on('connection', (ws, req) => {
       }
 
       case 'usage_update': {
-        if (usage[msg.accessCode] !== undefined) {
-          usage[msg.accessCode] += msg.bytes;
-        }
+        if (usage[msg.accessCode] !== undefined) usage[msg.accessCode] += msg.bytes;
         break;
       }
 
-      case 'ping': {
-        // Client-side ping for proxy backends
+      case 'heartbeat': {
+        // Application-level heartbeat from proxy
         if (ws.role === 'proxy' && ws.proxyId) {
           updateProxySeen(ws.proxyId);
-          ws.send(JSON.stringify({ type: 'pong' }));
+          ws.send(JSON.stringify({ type: 'heartbeat_ack' }));
         }
         break;
       }
@@ -285,7 +301,7 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (ws.role === 'proxy') {
       const pEntry = proxies.get(ws.proxyId);
-      if (pEntry) {
+      if (pEntry && !pEntry.stale) {
         console.log(`Proxy offline: ${ws.proxyId} (relayed ${(pEntry.bytesRelayed/1e6).toFixed(2)} MB, ${pEntry.activeTunnels} tunnels active)`);
       }
       proxies.delete(ws.proxyId);
@@ -296,28 +312,13 @@ wss.on('connection', (ws, req) => {
     if (ws.role === 'client' && ws.clientId) {
       clients.delete(ws.clientId);
     }
-    
-    // Clean up any bridges associated with this ws
-    // (bridges have their own close handlers that do cleanup)
   });
 });
 
-// ─── Periodic Health Check & Cleanup ────────────────────────────────────────
-setInterval(() => {
-  const now = Date.now();
-  
-  // Check for stale proxies (no message in 60s)
-  for (const [id, p] of proxies) {
-    if (now - p.lastSeen > 60000) {
-      const ws = p.ws;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        console.log(`Proxy ${id} stale (${Math.floor((now - p.lastSeen)/1000)}s), terminating`);
-        ws.terminate();
-      }
-    }
-  }
-
+// ─── Periodic Auth Sync ─────────────────────────────────────────────────────
+setInterval(async () => {
   // Log stats
+  const now = Date.now();
   const proxyCount = proxies.size;
   const clientCount = clients.size;
   const bridgeCount = activeBridges.size;
@@ -328,47 +329,44 @@ setInterval(() => {
 
   console.log(`\n[Status] Proxies:${proxyCount}(online:${onlineProxies}) Clients:${clientCount} Bridges:${bridgeCount}`);
   
-  // List all proxies and their tunnels
   for (const [id, p] of proxies) {
     const alive = p.ws && p.ws.readyState === WebSocket.OPEN;
     const idle = Math.floor((now - p.lastSeen) / 1000);
     console.log(`  ${alive ? '●' : '○'} ${id} | ${idle}s idle | ${p.activeTunnels || 0} tunnels | ${(p.bytesRelayed/1e6).toFixed(2)} MB`);
   }
 
-  // ── Auth sync ──
-  (async () => {
-    const invalid = [];
-    for (const code of Object.keys(usage)) {
-      if (usage[code] <= 0) continue;
-      if (!checkAccess(code)) invalid.push(code);
-    }
-    for (const code of invalid) {
-      console.log(`Auth revoked during sweep: ${code}`);
-      delete usage[code];
-    }
+  // Auth sync
+  const invalid = [];
+  for (const code of Object.keys(usage)) {
+    if (usage[code] <= 0) continue;
+    if (!checkAccess(code)) invalid.push(code);
+  }
+  for (const code of invalid) {
+    console.log(`Auth revoked during sweep: ${code}`);
+    delete usage[code];
+  }
 
-    for (const [code, bytes] of Object.entries(usage)) {
-      if (bytes > 0) {
-        await syncUsage(code, bytes);
-        usage[code] = 0;
-      }
+  for (const [code, bytes] of Object.entries(usage)) {
+    if (bytes > 0) {
+      await syncUsage(code, bytes);
+      usage[code] = 0;
     }
+  }
 
-    for (const [proxyId, bytes] of Object.entries(proxyUsage)) {
-      if (bytes > 0) {
-        await syncProxyUsage(proxyId, bytes);
-        proxyUsage[proxyId] = 0;
-      }
+  for (const [proxyId, bytes] of Object.entries(proxyUsage)) {
+    if (bytes > 0) {
+      await syncProxyUsage(proxyId, bytes);
+      proxyUsage[proxyId] = 0;
     }
-  })();
-}, 30000); // Check every 30s instead of 60s for faster reaction
+  }
+}, 60000);
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Relay HTTP+WS server listening on 0.0.0.0:${PORT}`);
   console.log(`Endpoints:`);
   console.log(`  GET /         - Health check`);
-  console.log(`  GET /proxies  - JSON list of all proxies with status`);
+  console.log(`  GET /proxies  - JSON list of all proxies`);
   console.log(`  GET /stats    - Full stats JSON`);
-  console.log(`  WS  /         - WebSocket for proxy backends and clients`);
+  console.log(`  WS  /         - WebSocket`);
 });
