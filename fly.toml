@@ -2,22 +2,20 @@ app = "bob-bwwvig"
 primary_region = "ams"
 
 [http_service]
+  internal_port = 10000
+  force_https = false
   auto_start_machines = true
   auto_stop_machines = true
-  force_https = false
-  internal_port = 10000
   min_machines_running = 0
-  processes = [ "app" ]
+  processes = ["app"]
 
-# Raw TCP service for SOCKS5 — no HTTP proxy in front
 [[services]]
   protocol = "tcp"
-  internal_port = 10000
+  internal_port = 1080
   processes = ["app"]
 
   [[services.ports]]
     port = 1080
-    handlers = []
 
 [[vm]]
   cpu_kind = "shared"
