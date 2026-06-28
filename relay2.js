@@ -229,7 +229,8 @@ const socksServer = net.createServer((clientSocket) => {
         return;
       }
 
-      if (!checkAccess(accessCode)) {
+      // 🔁 Pass proxyId to checkAccess (free‑trial restriction)
+      if (!checkAccess(accessCode, 0, proxyId)) {
         const r = Buffer.alloc(10);
         r[0] = 0x05; r[1] = 0x02; r[2] = 0x00; r[3] = 0x01;
         r.writeUInt32BE(0, 4); r.writeUInt16BE(0, 8);
@@ -361,15 +362,15 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ─── Periodic Health Check ──────────────────────────────────────────────────
+// ─── Periodic Health Check (modified) ──────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
+
+  // ✅ Clean up any entries that are already closed (edge case – safe)
   for (const [id, p] of proxies) {
-    if (now - p.lastSeen > 60000) {
-      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-        console.log(`Proxy ${id} stale, terminating`);
-        p.ws.terminate();
-      }
+    if (!p.ws || p.ws.readyState !== WebSocket.OPEN) {
+      proxies.delete(id);
+      delete proxyUsage[id];
     }
   }
 
