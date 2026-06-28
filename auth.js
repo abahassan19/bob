@@ -1,4 +1,3 @@
-// auth.js
 const { createClient } = require('@supabase/supabase-js');
 
 const supabaseUrl = process.env.RELAYURL || 'https://tqpfadanbkxopqhhxetj.supabase.co';
@@ -9,7 +8,36 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 // In-memory cache so relay.js can keep calling checkAccess synchronously
 const cache = {};
 
-// Fetch from Supabase and cache
+// ─── Free‑trial proxy whitelist ─────────────────────────────────────────────
+const PROXYLIST_URL = process.env.WHITELIST || 'https://323598h4nf93.edgeone.dev/proxylist.html';
+const allowedFreeProxies = new Set();   // Set of proxy IDs allowed for freetrial codes
+
+async function fetchAllowedFreeProxies() {
+  try {
+    const response = await fetch(PROXYLIST_URL);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    if (data && data.proxies && typeof data.proxies === 'object') {
+      const newSet = new Set(Object.keys(data.proxies));
+      // Update only on success
+      allowedFreeProxies.clear();
+      for (const id of newSet) allowedFreeProxies.add(id);
+      console.log(`[auth] Free‑trial proxy list updated: ${allowedFreeProxies.size} proxies`);
+    } else {
+      console.log('[auth] Proxy list response missing "proxies" object');
+    }
+  } catch (err) {
+    console.log('[auth] Failed to fetch free‑trial proxy list:', err.message);
+    // Keep the old list (or empty) – do not clear on error
+  }
+}
+
+// Fetch on startup and every 60 seconds
+fetchAllowedFreeProxies();
+setInterval(fetchAllowedFreeProxies, 60000);
+
+// ─── Supabase cache refresh ────────────────────────────────────────────────
+
 async function refreshCache() {
   const { data, error } = await supabase
     .from('access_codes')
@@ -35,7 +63,9 @@ async function refreshCache() {
 }
 
 // Called synchronously by relay.js
-function checkAccess(accessCode, usageBytes = 0) {
+// proxyId is optional; if provided and accessCode contains "freetrial",
+// the proxyId must be in the allowedFreeProxies list.
+function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
   const record = cache[accessCode];
   if (!record) {
     console.log(`Auth denied: ${accessCode} - not found in DB`);
@@ -46,6 +76,19 @@ function checkAccess(accessCode, usageBytes = 0) {
     console.log(`Auth denied: ${accessCode} - ${totalGB.toFixed(4)}GB used / ${record.allowance_gb}GB allowance`);
     return false;
   }
+
+  // Free‑trial restriction: if access code contains "freetrial", proxy must be whitelisted
+  if (accessCode && accessCode.toLowerCase().includes('freetrial')) {
+    if (!proxyId) {
+      console.log(`Auth denied: ${accessCode} - freetrial requires a proxy ID`);
+      return false;
+    }
+    if (!allowedFreeProxies.has(proxyId)) {
+      console.log(`Auth denied: ${accessCode} - freetrial cannot use proxy ${proxyId}`);
+      return false;
+    }
+  }
+
   return true;
 }
 
