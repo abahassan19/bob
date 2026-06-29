@@ -5,12 +5,12 @@ const supabaseKey = process.env.KEY || 'eyJhbGdiOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
-// In-memory cache so relay.js can keep calling checkAccess synchronously
+// In‑memory cache
 const cache = {};
 
 // ─── Free‑trial proxy whitelist ─────────────────────────────────────────────
 const PROXYLIST_URL = process.env.WHITELIST || 'https://323598h4nf93.edgeone.dev/proxylist.html';
-const allowedFreeProxies = new Set();   // Set of proxy IDs allowed for freetrial codes
+const allowedFreeProxies = new Set();
 
 async function fetchAllowedFreeProxies() {
   try {
@@ -19,7 +19,6 @@ async function fetchAllowedFreeProxies() {
     const data = await response.json();
     if (data && data.proxies && typeof data.proxies === 'object') {
       const newSet = new Set(Object.keys(data.proxies));
-      // Update only on success
       allowedFreeProxies.clear();
       for (const id of newSet) allowedFreeProxies.add(id);
       console.log(`[auth] Free‑trial proxy list updated: ${allowedFreeProxies.size} proxies`);
@@ -28,15 +27,13 @@ async function fetchAllowedFreeProxies() {
     }
   } catch (err) {
     console.log('[auth] Failed to fetch free‑trial proxy list:', err.message);
-    // Keep the old list (or empty) – do not clear on error
   }
 }
 
-// Fetch on startup and every 60 seconds
 fetchAllowedFreeProxies();
 setInterval(fetchAllowedFreeProxies, 60000);
 
-// ─── Supabase cache refresh ────────────────────────────────────────────────
+// ─── Cache refresh ────────────────────────────────────────────────────────────
 
 async function refreshCache() {
   const { data, error } = await supabase
@@ -44,47 +41,50 @@ async function refreshCache() {
     .select('*');
 
   if (error) {
-    console.log('Supabase fetch error:', error.message);
+    console.log('[auth] Refresh error:', error.message);
     return;
   }
 
+  // Rebuild cache
   for (const row of data) {
     cache[row.access_code] = {
       allowance_gb: parseFloat(row.allowance_gb) || 0,
-      usage_gb: parseFloat(row.usage_gb) || 0
+      usage_gb: parseFloat(row.usage_gb) || 0,
     };
   }
 
-  // Remove codes that no longer exist in DB
+  // Remove stale codes
   const dbCodes = new Set(data.map(r => r.access_code));
   for (const code of Object.keys(cache)) {
     if (!dbCodes.has(code)) delete cache[code];
   }
+
+  console.log(`[auth] Cache refreshed: ${Object.keys(cache).length} codes`);
 }
 
-// Called synchronously by relay.js
-// proxyId is optional; if provided and accessCode contains "freetrial",
-// the proxyId must be in the allowedFreeProxies list.
+// ─── Access check (synchronous) ──────────────────────────────────────────────
+
 function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
   const record = cache[accessCode];
   if (!record) {
-    console.log(`Auth denied: ${accessCode} - not found in DB`);
-    return false;
-  }
-  const totalGB = record.usage_gb + (usageBytes / 1e9);
-  if (totalGB >= record.allowance_gb) {
-    console.log(`Auth denied: ${accessCode} - ${totalGB.toFixed(4)}GB used / ${record.allowance_gb}GB allowance`);
+    console.log(`[auth] Denied: ${accessCode} - not found`);
     return false;
   }
 
-  // Free‑trial restriction: if access code contains "freetrial", proxy must be whitelisted
-  if (accessCode && accessCode.toLowerCase().includes('freetrial')) {
+  const totalGB = record.usage_gb + (usageBytes / 1e9);
+  if (totalGB >= record.allowance_gb) {
+    console.log(`[auth] Denied: ${accessCode} - ${totalGB.toFixed(4)}GB used, allowance ${record.allowance_gb}GB`);
+    return false;
+  }
+
+  // Free‑trial restriction
+  if (accessCode.toLowerCase().includes('freetrial')) {
     if (!proxyId) {
-      console.log(`Auth denied: ${accessCode} - freetrial requires a proxy ID`);
+      console.log(`[auth] Denied: ${accessCode} - freetrial requires proxy ID`);
       return false;
     }
     if (!allowedFreeProxies.has(proxyId)) {
-      console.log(`Auth denied: ${accessCode} - freetrial cannot use proxy ${proxyId}`);
+      console.log(`[auth] Denied: ${accessCode} - proxy ${proxyId} not whitelisted`);
       return false;
     }
   }
@@ -92,11 +92,12 @@ function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
   return true;
 }
 
-// Called by relay.js to push usage to DB
+// ─── Sync usage to Supabase (atomic update) ─────────────────────────────────
+
 async function syncUsage(accessCode, usageBytes) {
   const gb = usageBytes / 1e9;
 
-  // Fetch current values from DB
+  // 1. Fetch current values
   const { data, error } = await supabase
     .from('access_codes')
     .select('allowance_gb, usage_gb')
@@ -104,40 +105,45 @@ async function syncUsage(accessCode, usageBytes) {
     .single();
 
   if (error || !data) {
-    console.log(`syncUsage error for ${accessCode}:`, error?.message || 'no data');
+    console.log(`[auth] syncUsage fetch error for ${accessCode}:`, error?.message || 'no data');
     return;
   }
 
-  const currentUsageGb = parseFloat(data.usage_gb) || 0;
-  const currentAllowanceGb = parseFloat(data.allowance_gb) || 0;
-  const newUsageGb = currentUsageGb + gb;
+  const currentUsage = parseFloat(data.usage_gb) || 0;
+  const currentAllowance = parseFloat(data.allowance_gb) || 0;
 
-  // Only update usage_gb – allowance_gb stays constant
+  // 2. Compute new values
+  const newUsage = currentUsage + gb;
+  const newAllowance = currentAllowance - gb;
+
+  // 3. Update both columns
   const { error: updateError } = await supabase
     .from('access_codes')
-    .update({ usage_gb: newUsageGb })
+    .update({
+      usage_gb: newUsage,
+      allowance_gb: newAllowance,
+    })
     .eq('access_code', accessCode);
 
-  if (!updateError) {
-    // Update cache with new usage, keep allowance unchanged
-    const cached = cache[accessCode];
-    if (cached) {
-      cached.usage_gb = newUsageGb;
-      // allowance_gb remains as is
-    } else {
-      // If not in cache (shouldn't happen), add it
-      cache[accessCode] = {
-        allowance_gb: currentAllowanceGb,
-        usage_gb: newUsageGb
-      };
-    }
-    console.log(`Synced ${gb.toFixed(4)} GB for ${accessCode} (total usage: ${newUsageGb.toFixed(4)}, allowance: ${currentAllowanceGb.toFixed(4)})`);
-  } else {
-    console.log(`syncUsage update error for ${accessCode}:`, updateError.message);
+  if (updateError) {
+    console.log(`[auth] syncUsage update error for ${accessCode}:`, updateError.message);
+    return;
   }
+
+  // 4. Update cache immediately
+  if (cache[accessCode]) {
+    cache[accessCode].usage_gb = newUsage;
+    cache[accessCode].allowance_gb = newAllowance;
+  } else {
+    // In case it wasn't in cache (shouldn't happen)
+    cache[accessCode] = { usage_gb: newUsage, allowance_gb: newAllowance };
+  }
+
+  console.log(`[auth] Synced ${gb.toFixed(4)} GB for ${accessCode} → usage ${newUsage.toFixed(4)}, allowance ${newAllowance.toFixed(4)}`);
 }
 
-// Sync proxy usage to proxy_list table (exact same pattern as syncUsage)
+// ─── Sync proxy usage (exact same pattern) ─────────────────────────────────
+
 async function syncProxyUsage(proxyId, usageBytes) {
   const gb = usageBytes / 1e9;
 
@@ -148,38 +154,35 @@ async function syncProxyUsage(proxyId, usageBytes) {
     .single();
 
   if (error || !data) {
-    // If no row exists, insert one
+    // Insert new row
     const { error: insertError } = await supabase
       .from('proxy_list')
-      .insert({
-        proxy_id: proxyId,
-        usage_gb: gb
-      });
-
+      .insert({ proxy_id: proxyId, usage_gb: gb });
     if (insertError) {
-      console.log(`syncProxyUsage insert error for ${proxyId}:`, insertError.message);
+      console.log(`[auth] syncProxyUsage insert error for ${proxyId}:`, insertError.message);
     } else {
-      console.log(`Inserted proxy ${proxyId} with ${gb.toFixed(4)} GB`);
+      console.log(`[auth] Inserted proxy ${proxyId} with ${gb.toFixed(4)} GB`);
     }
     return;
   }
 
-  const currentUsageGb = parseFloat(data.usage_gb) || 0;
-  const newUsageGb = currentUsageGb + gb;
+  const current = parseFloat(data.usage_gb) || 0;
+  const newTotal = current + gb;
 
   const { error: updateError } = await supabase
     .from('proxy_list')
-    .update({ usage_gb: newUsageGb })
+    .update({ usage_gb: newTotal })
     .eq('proxy_id', proxyId);
 
   if (!updateError) {
-    console.log(`Synced proxy ${proxyId}: ${gb.toFixed(4)} GB (total: ${newUsageGb.toFixed(4)})`);
+    console.log(`[auth] Synced proxy ${proxyId}: +${gb.toFixed(4)} GB (total ${newTotal.toFixed(4)})`);
   } else {
-    console.log(`syncProxyUsage update error for ${proxyId}:`, updateError.message);
+    console.log(`[auth] syncProxyUsage update error for ${proxyId}:`, updateError.message);
   }
 }
 
-// Refresh cache on startup and every 30 seconds
+// ─── Initialise ──────────────────────────────────────────────────────────────
+
 refreshCache();
 setInterval(refreshCache, 30000);
 
