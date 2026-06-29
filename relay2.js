@@ -51,13 +51,21 @@ function saveProxyList() {
   fs.writeFileSync('proxies.json', JSON.stringify(list, null, 2), 'utf8');
 }
 
+// ─── Strict proxy picker (NO FALLBACK) ─────────────────────────────────────
 function pickProxy(proxyId) {
-  const available = [...proxies.entries()].filter(([_, p]) =>
-    p.ws && p.ws.readyState === WebSocket.OPEN
-  );
-  if (available.length === 0) return null;
-  if (!proxyId || proxyId === 'default') return available[0];
-  return available.find(([id]) => id === proxyId) || available[0];
+  if (!proxyId || proxyId === 'default') {
+    const available = [...proxies.entries()].filter(([_, p]) =>
+      p.ws && p.ws.readyState === WebSocket.OPEN
+    );
+    return available.length ? available[0] : null;
+  }
+
+  const p = proxies.get(proxyId);
+  if (p && p.ws && p.ws.readyState === WebSocket.OPEN) {
+    return [proxyId, p];
+  }
+  console.log(`[pickProxy] Requested proxy "${proxyId}" is offline or not registered`);
+  return null;
 }
 
 // ─── Bridge ─────────────────────────────────────────────────────────────────
@@ -68,7 +76,6 @@ function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode
   let bytes = 0;
   let alive = true;
   let cleanupTimer = null;
-  let remoteClosed = false;
 
   proxyEntry.activeTunnels = (proxyEntry.activeTunnels || 0) + 1;
   if (!usage[accessCode]) usage[accessCode] = 0;
@@ -219,6 +226,15 @@ const socksServer = net.createServer((clientSocket) => {
 
       console.log(`SOCKS5 connect: ${proxyId}:${accessCode} -> ${host}:${port}`);
 
+      if (!checkAccess(accessCode, 0, proxyId)) {
+        const r = Buffer.alloc(10);
+        r[0] = 0x05; r[1] = 0x02; r[2] = 0x00; r[3] = 0x01;
+        r.writeUInt32BE(0, 4); r.writeUInt16BE(0, 8);
+        clientSocket.write(r);
+        die();
+        return;
+      }
+
       const picked = pickProxy(proxyId);
       if (!picked) {
         const r = Buffer.alloc(10);
@@ -229,20 +245,9 @@ const socksServer = net.createServer((clientSocket) => {
         return;
       }
 
-      // 🔁 Pass proxyId to checkAccess (free‑trial restriction)
-      if (!checkAccess(accessCode, 0, proxyId)) {
-        const r = Buffer.alloc(10);
-        r[0] = 0x05; r[1] = 0x02; r[2] = 0x00; r[3] = 0x01;
-        r.writeUInt32BE(0, 4); r.writeUInt16BE(0, 8);
-        clientSocket.write(r);
-        die();
-        return;
-      }
-
       const [selectedProxyId, proxyEntry] = picked;
       const clientId = `socks:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
 
-      // Send SOCKS5 success IMMEDIATELY
       const r = Buffer.alloc(10);
       r[0] = 0x05; r[1] = 0x00; r[2] = 0x00; r[3] = 0x01;
       r.writeUInt32BE(0x7F000001, 4);
@@ -306,9 +311,21 @@ wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
   ws.on('ping', () => { ws.pong(); });
 
+  // Keep lastSeen fresh on any WebSocket pong (proxy sends ping frames)
+  ws.on('pong', () => {
+    if (ws.role === 'proxy' && ws.proxyId) {
+      updateProxySeen(ws.proxyId);
+    }
+  });
+
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
+
+    // Update lastSeen on any JSON message from proxy
+    if (ws.role === 'proxy' && ws.proxyId) {
+      updateProxySeen(ws.proxyId);
+    }
 
     switch (msg.type) {
       case 'register_proxy':
@@ -341,6 +358,7 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'ping':
+        // Application-level ping (not used by proxy, but handle anyway)
         if (ws.role === 'proxy' && ws.proxyId) {
           updateProxySeen(ws.proxyId);
           ws.send(JSON.stringify({ type: 'pong' }));
@@ -362,15 +380,16 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// ─── Periodic Health Check (modified) ──────────────────────────────────────
+// ─── Periodic Health Check ──────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-
-  // ✅ Clean up any entries that are already closed (edge case – safe)
   for (const [id, p] of proxies) {
-    if (!p.ws || p.ws.readyState !== WebSocket.OPEN) {
-      proxies.delete(id);
-      delete proxyUsage[id];
+    // If lastSeen is older than 120 seconds, consider it dead
+    if (now - p.lastSeen > 120000) {
+      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+        console.log(`Proxy ${id} stale (lastSeen ${now - p.lastSeen}ms ago), terminating`);
+        p.ws.terminate();
+      }
     }
   }
 
