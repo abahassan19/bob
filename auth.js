@@ -50,8 +50,8 @@ async function refreshCache() {
 
   for (const row of data) {
     cache[row.access_code] = {
-      allowance_gb: parseFloat(row.allowance_gb),
-      usage_gb: parseFloat(row.usage_gb)
+      allowance_gb: parseFloat(row.allowance_gb) || 0,
+      usage_gb: parseFloat(row.usage_gb) || 0
     };
   }
 
@@ -96,6 +96,7 @@ function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
 async function syncUsage(accessCode, usageBytes) {
   const gb = usageBytes / 1e9;
 
+  // Fetch current values from DB
   const { data, error } = await supabase
     .from('access_codes')
     .select('allowance_gb, usage_gb')
@@ -107,38 +108,36 @@ async function syncUsage(accessCode, usageBytes) {
     return;
   }
 
-  const currentUsageGb = parseFloat(data.usage_gb);
-  const currentAllowanceGb = parseFloat(data.allowance_gb);
+  const currentUsageGb = parseFloat(data.usage_gb) || 0;
+  const currentAllowanceGb = parseFloat(data.allowance_gb) || 0;
+  const newUsageGb = currentUsageGb + gb;
 
-  // Calculate what we need to add
-  const cachedRecord = cache[accessCode];
+  // Only update usage_gb – allowance_gb stays constant
+  const { error: updateError } = await supabase
+    .from('access_codes')
+    .update({ usage_gb: newUsageGb })
+    .eq('access_code', accessCode);
 
-  if (cachedRecord) {
-    // Update cache immediately so checkAccess sees it
-    const newUsageGb = cachedRecord.usage_gb + gb;
-    const newAllowanceGb = cachedRecord.allowance_gb - gb - 1e-9; // tiny buffer to prevent edge case
-
-    const { error: updateError } = await supabase
-      .from('access_codes')
-      .update({
-        usage_gb: currentUsageGb + gb,
-        allowance_gb: currentAllowanceGb - gb
-      })
-      .eq('access_code', accessCode);
-
-    if (!updateError) {
+  if (!updateError) {
+    // Update cache with new usage, keep allowance unchanged
+    const cached = cache[accessCode];
+    if (cached) {
+      cached.usage_gb = newUsageGb;
+      // allowance_gb remains as is
+    } else {
+      // If not in cache (shouldn't happen), add it
       cache[accessCode] = {
-        allowance_gb: newAllowanceGb,
+        allowance_gb: currentAllowanceGb,
         usage_gb: newUsageGb
       };
-      console.log(`Synced ${gb.toFixed(4)} GB for ${accessCode} (usage: ${newUsageGb.toFixed(4)}, allowance: ${newAllowanceGb.toFixed(4)})`);
-    } else {
-      console.log(`syncUsage update error for ${accessCode}:`, updateError.message);
     }
+    console.log(`Synced ${gb.toFixed(4)} GB for ${accessCode} (total usage: ${newUsageGb.toFixed(4)}, allowance: ${currentAllowanceGb.toFixed(4)})`);
+  } else {
+    console.log(`syncUsage update error for ${accessCode}:`, updateError.message);
   }
 }
 
-// NEW: Sync proxy usage to proxy_list table (exact same pattern as syncUsage)
+// Sync proxy usage to proxy_list table (exact same pattern as syncUsage)
 async function syncProxyUsage(proxyId, usageBytes) {
   const gb = usageBytes / 1e9;
 
@@ -165,7 +164,7 @@ async function syncProxyUsage(proxyId, usageBytes) {
     return;
   }
 
-  const currentUsageGb = parseFloat(data.usage_gb);
+  const currentUsageGb = parseFloat(data.usage_gb) || 0;
   const newUsageGb = currentUsageGb + gb;
 
   const { error: updateError } = await supabase
