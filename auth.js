@@ -1,7 +1,7 @@
 const { createClient } = require('@supabase/supabase-js');
 
 const supabaseUrl = process.env.RELAYURL || 'https://tqpfadanbkxopqhhxetj.supabase.co';
-const supabaseKey = process.env.KEY || 'eyJhbGdiOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRxcGZhcmFuYmt4cGpxaGh4ZXRqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODgxOTgyMCwiZXhwIjoyMDk0Mzk1ODIwfQ.w_-cRoX2dDktoFbcO3oe__vhDLjk_cabZTIc7Y4Jb1s';
+const supabaseKey = process.env.KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRxcGZhcmFuYmt4cGpxaGh4ZXRqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODgxOTgyMCwiZXhwIjoyMDk0Mzk1ODIwfQ.w_-cRoX2dDktoFbcO3oe__vhDLjk_cabZTIc7Y4Jb1s';
 
 const supabase = createClient(supabaseUrl, supabaseKey);
 
@@ -47,14 +47,15 @@ async function refreshCache() {
 
   // Rebuild cache
   for (const row of data) {
-    cache[row.access_code] = {
+    const code = row.access_code.trim(); // trim to avoid whitespace issues
+    cache[code] = {
       allowance_gb: parseFloat(row.allowance_gb) || 0,
       usage_gb: parseFloat(row.usage_gb) || 0,
     };
   }
 
   // Remove stale codes
-  const dbCodes = new Set(data.map(r => r.access_code));
+  const dbCodes = new Set(data.map(r => r.access_code.trim()));
   for (const code of Object.keys(cache)) {
     if (!dbCodes.has(code)) delete cache[code];
   }
@@ -65,28 +66,33 @@ async function refreshCache() {
 // ─── Access check (synchronous) ──────────────────────────────────────────────
 
 function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
-  const record = cache[accessCode];
+  // Trim to avoid accidental spaces
+  const code = accessCode.trim();
+  const record = cache[code];
   if (!record) {
-    console.log(`[auth] Denied: ${accessCode} - not found`);
+    console.log(`[auth] Denied: ${code} - not found in cache`);
     return false;
   }
 
   const totalGB = record.usage_gb + (usageBytes / 1e9);
   if (totalGB >= record.allowance_gb) {
-    console.log(`[auth] Denied: ${accessCode} - ${totalGB.toFixed(4)}GB used, allowance ${record.allowance_gb}GB`);
+    console.log(`[auth] Denied: ${code} - ${totalGB.toFixed(4)}GB used, allowance ${record.allowance_gb}GB`);
     return false;
   }
 
-  // Free‑trial restriction
-  if (accessCode.toLowerCase().includes('freetrial')) {
+  // Free‑trial restriction – with debug logs
+  const isFreeTrial = code.toLowerCase().includes('freetrial');
+  if (isFreeTrial) {
+    console.log(`[auth] Free‑trial check for code "${code}" with proxyId "${proxyId}"`);
     if (!proxyId) {
-      console.log(`[auth] Denied: ${accessCode} - freetrial requires proxy ID`);
+      console.log(`[auth] Denied: ${code} - freetrial requires a proxy ID`);
       return false;
     }
     if (!allowedFreeProxies.has(proxyId)) {
-      console.log(`[auth] Denied: ${accessCode} - proxy ${proxyId} not whitelisted`);
+      console.log(`[auth] Denied: ${code} - proxy ${proxyId} not in whitelist (${allowedFreeProxies.size} proxies allowed)`);
       return false;
     }
+    console.log(`[auth] Allowed: ${code} - proxy ${proxyId} is whitelisted`);
   }
 
   return true;
@@ -95,17 +101,25 @@ function checkAccess(accessCode, usageBytes = 0, proxyId = null) {
 // ─── Sync usage to Supabase (atomic update) ─────────────────────────────────
 
 async function syncUsage(accessCode, usageBytes) {
+  const code = accessCode.trim();
   const gb = usageBytes / 1e9;
+
+  console.log(`[auth] syncUsage called for "${code}" with ${gb.toFixed(6)} GB`);
+
+  if (gb === 0) {
+    console.log(`[auth] syncUsage: zero bytes, skipping`);
+    return;
+  }
 
   // 1. Fetch current values
   const { data, error } = await supabase
     .from('access_codes')
     .select('allowance_gb, usage_gb')
-    .eq('access_code', accessCode)
+    .eq('access_code', code)
     .single();
 
   if (error || !data) {
-    console.log(`[auth] syncUsage fetch error for ${accessCode}:`, error?.message || 'no data');
+    console.log(`[auth] syncUsage fetch error for "${code}":`, error?.message || 'no data returned');
     return;
   }
 
@@ -123,29 +137,31 @@ async function syncUsage(accessCode, usageBytes) {
       usage_gb: newUsage,
       allowance_gb: newAllowance,
     })
-    .eq('access_code', accessCode);
+    .eq('access_code', code);
 
   if (updateError) {
-    console.log(`[auth] syncUsage update error for ${accessCode}:`, updateError.message);
+    console.log(`[auth] syncUsage update error for "${code}":`, updateError.message);
     return;
   }
 
   // 4. Update cache immediately
-  if (cache[accessCode]) {
-    cache[accessCode].usage_gb = newUsage;
-    cache[accessCode].allowance_gb = newAllowance;
+  if (cache[code]) {
+    cache[code].usage_gb = newUsage;
+    cache[code].allowance_gb = newAllowance;
   } else {
-    // In case it wasn't in cache (shouldn't happen)
-    cache[accessCode] = { usage_gb: newUsage, allowance_gb: newAllowance };
+    cache[code] = { usage_gb: newUsage, allowance_gb: newAllowance };
   }
 
-  console.log(`[auth] Synced ${gb.toFixed(4)} GB for ${accessCode} → usage ${newUsage.toFixed(4)}, allowance ${newAllowance.toFixed(4)}`);
+  console.log(`[auth] Synced ${gb.toFixed(4)} GB for "${code}" → usage ${newUsage.toFixed(4)}, allowance ${newAllowance.toFixed(4)}`);
 }
 
 // ─── Sync proxy usage (exact same pattern) ─────────────────────────────────
 
 async function syncProxyUsage(proxyId, usageBytes) {
   const gb = usageBytes / 1e9;
+  if (gb === 0) return;
+
+  console.log(`[auth] syncProxyUsage called for "${proxyId}" with ${gb.toFixed(6)} GB`);
 
   const { data, error } = await supabase
     .from('proxy_list')
@@ -159,9 +175,9 @@ async function syncProxyUsage(proxyId, usageBytes) {
       .from('proxy_list')
       .insert({ proxy_id: proxyId, usage_gb: gb });
     if (insertError) {
-      console.log(`[auth] syncProxyUsage insert error for ${proxyId}:`, insertError.message);
+      console.log(`[auth] syncProxyUsage insert error for "${proxyId}":`, insertError.message);
     } else {
-      console.log(`[auth] Inserted proxy ${proxyId} with ${gb.toFixed(4)} GB`);
+      console.log(`[auth] Inserted proxy "${proxyId}" with ${gb.toFixed(4)} GB`);
     }
     return;
   }
@@ -175,9 +191,9 @@ async function syncProxyUsage(proxyId, usageBytes) {
     .eq('proxy_id', proxyId);
 
   if (!updateError) {
-    console.log(`[auth] Synced proxy ${proxyId}: +${gb.toFixed(4)} GB (total ${newTotal.toFixed(4)})`);
+    console.log(`[auth] Synced proxy "${proxyId}": +${gb.toFixed(4)} GB (total ${newTotal.toFixed(4)})`);
   } else {
-    console.log(`[auth] syncProxyUsage update error for ${proxyId}:`, updateError.message);
+    console.log(`[auth] syncProxyUsage update error for "${proxyId}":`, updateError.message);
   }
 }
 
