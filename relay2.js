@@ -404,7 +404,7 @@ setInterval(() => {
     const invalid = [];
     for (const code of Object.keys(usage)) {
       if (usage[code] <= 0) continue;
-      if (!checkAccess(code)) invalid.push(code);
+      if (!checkAccess(code, 0, null, true)) invalid.push(code);
     }
     for (const code of invalid) { console.log(`Auth revoked: ${code}`); delete usage[code]; }
     for (const [code, bytes] of Object.entries(usage)) {
