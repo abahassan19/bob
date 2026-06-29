@@ -273,14 +273,14 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  if (req.url === '/proxies') {
+  if (req.url === '/proxies1234567890') {
     const data = getProxyHealth();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
     return;
   }
 
-  if (req.url === '/stats') {
+  if (req.url === '/stats1234567890stats') {
     const proxyHealth = getProxyHealth();
     const usageSummary = {};
     for (const [code, bytes] of Object.entries(usage)) {
