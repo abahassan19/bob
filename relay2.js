@@ -16,12 +16,17 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const proxies = new Map();
+const proxies = new Map(); // proxyId -> { ws, proxyId, connectedAt, lastSeen, ip, bytesRelayed, activeTunnels }
 const usage = {};
 const proxyUsage = {};
 const activeBridges = new Map();
 const PIPE_TIMEOUT = 300000;
 let bridgeCounter = 0;
+
+// Pending SOCKS5 requests waiting for a proxy to come online
+const pendingRequests = new Map(); // proxyId -> Array of { clientSocket, host, port, accessCode, clientId, timer }
+const pendingAnyRequests = []; // Array of similar objects for "random" proxy requests
+const REQUEST_TIMEOUT = 30000; // 30 seconds
 
 // ─── Proxy Health ────────────────────────────────────────────────────────────
 function updateProxySeen(proxyId) {
@@ -51,24 +56,83 @@ function saveProxyList() {
   fs.writeFileSync('proxies.json', JSON.stringify(list, null, 2), 'utf8');
 }
 
-// ─── Strict proxy picker (NO FALLBACK) ─────────────────────────────────────
+// ─── Proxy picker with waiting support ─────────────────────────────────────
+// Returns: { found: true, proxyId, proxyEntry } or { found: false, canWait: true/false }
 function pickProxy(proxyId) {
-  if (!proxyId || proxyId === 'default') {
+  // If "random", we try to find any online proxy
+  if (proxyId === 'random') {
     const available = [...proxies.entries()].filter(([_, p]) =>
       p.ws && p.ws.readyState === WebSocket.OPEN
     );
-    return available.length ? available[0] : null;
+    if (available.length) {
+      // Pick a random one
+      const idx = Math.floor(Math.random() * available.length);
+      const [id, entry] = available[idx];
+      return { found: true, proxyId: id, proxyEntry: entry };
+    }
+    // No online proxy – we can wait for any to come online
+    return { found: false, canWait: true, isRandom: true };
   }
 
+  // Specific proxy
   const p = proxies.get(proxyId);
   if (p && p.ws && p.ws.readyState === WebSocket.OPEN) {
-    return [proxyId, p];
+    return { found: true, proxyId, proxyEntry: p };
   }
-  console.log(`[pickProxy] Requested proxy "${proxyId}" is offline or not registered`);
-  return null;
+
+  // Proxy may be registered but offline – we can wait for it
+  if (proxies.has(proxyId)) {
+    return { found: false, canWait: true, isRandom: false };
+  }
+
+  // Proxy never registered – cannot wait
+  return { found: false, canWait: false };
 }
 
-// ─── Bridge ─────────────────────────────────────────────────────────────────
+// ─── Process pending requests for a proxy that just came online ────────────
+function processPendingForProxy(proxyId, proxyEntry) {
+  const list = pendingRequests.get(proxyId) || [];
+  if (list.length === 0) return;
+
+  // We'll take the first pending and process it
+  // We'll process one at a time (FIFO) to avoid overloading the proxy
+  const req = list.shift();
+  if (list.length === 0) pendingRequests.delete(proxyId);
+
+  // Clear the timer
+  if (req.timer) clearTimeout(req.timer);
+
+  // Now we can proceed with the connection
+  proceedWithConnection(req.clientSocket, proxyId, proxyEntry, req.clientId, req.host, req.port, req.accessCode);
+}
+
+// Process any pending "random" requests with the newly connected proxy
+function processPendingAny(proxyId, proxyEntry) {
+  if (pendingAnyRequests.length === 0) return;
+  const req = pendingAnyRequests.shift();
+  if (req.timer) clearTimeout(req.timer);
+  proceedWithConnection(req.clientSocket, proxyId, proxyEntry, req.clientId, req.host, req.port, req.accessCode);
+}
+
+// ─── Actually send SOCKS5 reply and create bridge ─────────────────────────
+function proceedWithConnection(clientSocket, proxyId, proxyEntry, clientId, host, port, accessCode) {
+  // Send SOCKS5 success reply
+  const r = Buffer.alloc(10);
+  r[0] = 0x05; r[1] = 0x00; r[2] = 0x00; r[3] = 0x01;
+  r.writeUInt32BE(0x7F000001, 4);
+  r.writeUInt16BE(0, 8);
+  clientSocket.write(r);
+
+  const bridgeId = createBridge(
+    clientSocket,
+    { ...proxyEntry, proxyId },
+    clientId, host, port, accessCode
+  );
+
+  console.log(`Tunnel: ${proxyId}/${accessCode} -> ${host}:${port} [bridge#${bridgeId}]`);
+}
+
+// ─── Bridge (unchanged) ────────────────────────────────────────────────────
 function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode) {
   const proxyWs = proxyEntry.ws;
   const proxyId = proxyEntry.proxyId;
@@ -146,7 +210,7 @@ function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode
   return bridgeId;
 }
 
-// ─── SOCKS5 Server (port 1080) ──────────────────────────────────────────────
+// ─── SOCKS5 Server ──────────────────────────────────────────────────────────
 const socksServer = net.createServer((clientSocket) => {
   let dead = false;
   let proxyId = null;
@@ -227,45 +291,88 @@ const socksServer = net.createServer((clientSocket) => {
       console.log(`SOCKS5 connect: ${proxyId}:${accessCode} -> ${host}:${port}`);
 
       if (!checkAccess(accessCode, 0, proxyId)) {
-        const r = Buffer.alloc(10);
-        r[0] = 0x05; r[1] = 0x02; r[2] = 0x00; r[3] = 0x01;
-        r.writeUInt32BE(0, 4); r.writeUInt16BE(0, 8);
-        clientSocket.write(r);
+        sendSocksError(clientSocket, 0x02); // connection not allowed
         die();
         return;
       }
 
-      const picked = pickProxy(proxyId);
-      if (!picked) {
-        const r = Buffer.alloc(10);
-        r[0] = 0x05; r[1] = 0x04; r[2] = 0x00; r[3] = 0x01;
-        r.writeUInt32BE(0, 4); r.writeUInt16BE(0, 8);
-        clientSocket.write(r);
+      // Try to pick a proxy
+      const pickResult = pickProxy(proxyId);
+
+      if (pickResult.found) {
+        // Proxy is online, proceed immediately
+        const clientId = `socks:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+        proceedWithConnection(clientSocket, pickResult.proxyId, pickResult.proxyEntry, clientId, host, port, accessCode);
+        return;
+      }
+
+      // Proxy not found – can we wait?
+      if (!pickResult.canWait) {
+        // Proxy never registered – cannot wait, reject
+        console.log(`Proxy ${proxyId} never registered, rejecting`);
+        sendSocksError(clientSocket, 0x04); // host unreachable
         die();
         return;
       }
 
-      const [selectedProxyId, proxyEntry] = picked;
+      // We can wait for the proxy to come online
       const clientId = `socks:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-
-      const r = Buffer.alloc(10);
-      r[0] = 0x05; r[1] = 0x00; r[2] = 0x00; r[3] = 0x01;
-      r.writeUInt32BE(0x7F000001, 4);
-      r.writeUInt16BE(0, 8);
-      clientSocket.write(r);
-
-      const bridgeId = createBridge(
+      const request = {
         clientSocket,
-        { ...proxyEntry, proxyId: selectedProxyId },
-        clientId, host, port, accessCode
-      );
+        host,
+        port,
+        accessCode,
+        clientId,
+        timer: null
+      };
 
-      console.log(`Tunnel: ${selectedProxyId}/${accessCode} -> ${host}:${port} [bridge#${bridgeId}]`);
+      // Set a timeout to reject if proxy doesn't come back
+      const timer = setTimeout(() => {
+        // Remove from queue
+        if (pickResult.isRandom) {
+          const idx = pendingAnyRequests.indexOf(request);
+          if (idx !== -1) pendingAnyRequests.splice(idx, 1);
+        } else {
+          const list = pendingRequests.get(proxyId) || [];
+          const idx = list.indexOf(request);
+          if (idx !== -1) list.splice(idx, 1);
+          if (list.length === 0) pendingRequests.delete(proxyId);
+        }
+        // Send SOCKS5 error and close
+        console.log(`Timeout waiting for proxy ${proxyId} (${accessCode} -> ${host}:${port})`);
+        sendSocksError(clientSocket, 0x04); // host unreachable
+        die();
+      }, REQUEST_TIMEOUT);
+      request.timer = timer;
+
+      // Store in appropriate queue
+      if (pickResult.isRandom) {
+        pendingAnyRequests.push(request);
+        console.log(`Queued random request for ${host}:${port} (waiting for any proxy)`);
+      } else {
+        if (!pendingRequests.has(proxyId)) pendingRequests.set(proxyId, []);
+        pendingRequests.get(proxyId).push(request);
+        console.log(`Queued request for proxy ${proxyId} (${host}:${port})`);
+      }
+
+      // Do NOT send SOCKS5 reply yet – client will wait
     });
   }
 });
 
-// ─── HTTP Server (port 10000 — health, proxies, WS) ──────────────────────
+// Helper to send SOCKS5 error reply
+function sendSocksError(socket, code) {
+  const r = Buffer.alloc(10);
+  r[0] = 0x05;
+  r[1] = code; // 0x02 = not allowed, 0x04 = host unreachable, etc.
+  r[2] = 0x00;
+  r[3] = 0x01;
+  r.writeUInt32BE(0, 4);
+  r.writeUInt16BE(0, 8);
+  try { socket.write(r); } catch {}
+}
+
+// ─── HTTP Server ──────────────────────────────────────────────────────────
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/healthz' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -284,14 +391,13 @@ const httpServer = http.createServer((req, res) => {
   res.end();
 });
 
-// ─── WebSocket Server (proxy backends connect here) ─────────────────────────
+// ─── WebSocket Server ─────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server: httpServer });
 
 wss.on('connection', (ws, req) => {
   ws.on('error', () => {});
   ws.on('ping', () => { ws.pong(); });
 
-  // Keep lastSeen fresh on any WebSocket pong (proxy sends ping frames)
   ws.on('pong', () => {
     if (ws.role === 'proxy' && ws.proxyId) {
       updateProxySeen(ws.proxyId);
@@ -302,7 +408,6 @@ wss.on('connection', (ws, req) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
 
-    // Update lastSeen on any JSON message from proxy
     if (ws.role === 'proxy' && ws.proxyId) {
       updateProxySeen(ws.proxyId);
     }
@@ -331,6 +436,12 @@ wss.on('connection', (ws, req) => {
         ws.send(JSON.stringify({ type: 'registered' }));
         console.log(`Proxy online: ${msg.proxyId} from ${req.socket.remoteAddress}`);
         saveProxyList();
+
+        // Process any pending requests for this proxy
+        const proxyEntry = proxies.get(msg.proxyId);
+        processPendingForProxy(msg.proxyId, proxyEntry);
+        // Also process one pending "any" request using this proxy
+        processPendingAny(msg.proxyId, proxyEntry);
         break;
 
       case 'usage_update':
@@ -355,6 +466,9 @@ wss.on('connection', (ws, req) => {
       proxies.delete(ws.proxyId);
       delete proxyUsage[ws.proxyId];
       saveProxyList();
+
+      // Optionally, we could keep pending requests for this proxy – they will timeout
+      // We could also remove them immediately to free resources, but we'll let timeout handle
     }
   });
 });
@@ -363,7 +477,6 @@ wss.on('connection', (ws, req) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, p] of proxies) {
-    // If lastSeen is older than 120 seconds, consider it dead
     if (now - p.lastSeen > 120000) {
       if (p.ws && p.ws.readyState === WebSocket.OPEN) {
         console.log(`Proxy ${id} stale (lastSeen ${now - p.lastSeen}ms ago), terminating`);
@@ -373,7 +486,7 @@ setInterval(() => {
   }
 
   const online = [...proxies.values()].filter(p => p.ws && p.ws.readyState === WebSocket.OPEN).length;
-  console.log(`\n[Status] Proxies:${proxies.size}(online:${online}) Bridges:${activeBridges.size}`);
+  console.log(`\n[Status] Proxies:${proxies.size}(online:${online}) Bridges:${activeBridges.size} Pending:${pendingRequests.size + pendingAnyRequests.length}`);
   for (const [id, p] of proxies) {
     const alive = p.ws && p.ws.readyState === WebSocket.OPEN;
     console.log(`  ${alive ? '●' : '○'} ${id} | ${Math.floor((now - p.lastSeen)/1000)}s idle | ${p.activeTunnels || 0} tunnels | ${(p.bytesRelayed/1e6).toFixed(2)} MB`);
@@ -395,7 +508,7 @@ setInterval(() => {
   })();
 }, 30000);
 
-// ─── Start Both Servers ─────────────────────────────────────────────────────
+// ─── Start Servers ──────────────────────────────────────────────────────────
 httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`HTTP/WS server on 0.0.0.0:${HTTP_PORT}`);
   console.log(`  Proxy backends connect via WebSocket to ws://host:${HTTP_PORT}`);
@@ -405,4 +518,5 @@ httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
 socksServer.listen(SOCKS_PORT, '0.0.0.0', () => {
   console.log(`SOCKS5 server on 0.0.0.0:${SOCKS_PORT}`);
   console.log(`  curl --socks5 host:${SOCKS_PORT} -U proxyid:accesscode https://example.com`);
+  console.log(`  Use username "random" to pick any available proxy`);
 });
