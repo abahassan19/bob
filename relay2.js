@@ -29,22 +29,6 @@ function updateProxySeen(proxyId) {
   if (p) p.lastSeen = Date.now();
 }
 
-function getProxyHealth() {
-  const now = Date.now();
-  const list = {};
-  for (const [id, p] of proxies) {
-    list[id] = {
-      connected: p.ws && p.ws.readyState === WebSocket.OPEN,
-      uptime: Math.floor((now - p.connectedAt) / 1000),
-      lastSeen: Math.floor((now - p.lastSeen) / 1000) + 's ago',
-      ip: p.ip,
-      bytesRelayed: p.bytesRelayed,
-      activeTunnels: p.activeTunnels || 0
-    };
-  }
-  return list;
-}
-
 function saveProxyList() {
   const list = {};
   for (const [id] of proxies) list[id] = { connected: true };
@@ -265,38 +249,11 @@ const socksServer = net.createServer((clientSocket) => {
   }
 });
 
-// ─── HTTP Server (port 10000 — health, stats, WS) ───────────────────────────
+// ─── HTTP Server (port 10000 — health, WS) ────────────────────────────────
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/healthz' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('OK');
-    return;
-  }
-
-  if (req.url === '/proxies1234567890') {
-    const data = getProxyHealth();
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
-    return;
-  }
-
-  if (req.url === '/stats1234567890stats') {
-    const proxyHealth = getProxyHealth();
-    const usageSummary = {};
-    for (const [code, bytes] of Object.entries(usage)) {
-      if (bytes > 0) usageSummary[code] = (bytes / 1e6).toFixed(2) + ' MB';
-    }
-    const proxyUsageSummary = {};
-    for (const [id, bytes] of Object.entries(proxyUsage)) {
-      if (bytes > 0) proxyUsageSummary[id] = (bytes / 1e6).toFixed(2) + ' MB';
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      proxies: proxyHealth,
-      activeBridges: activeBridges.size,
-      usage: usageSummary,
-      proxyUsage: proxyUsageSummary
-    }));
     return;
   }
 
@@ -358,7 +315,6 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'ping':
-        // Application-level ping (not used by proxy, but handle anyway)
         if (ws.role === 'proxy' && ws.proxyId) {
           updateProxySeen(ws.proxyId);
           ws.send(JSON.stringify({ type: 'pong' }));
@@ -420,7 +376,7 @@ setInterval(() => {
 httpServer.listen(HTTP_PORT, '0.0.0.0', () => {
   console.log(`HTTP/WS server on 0.0.0.0:${HTTP_PORT}`);
   console.log(`  Proxy backends connect via WebSocket to ws://host:${HTTP_PORT}`);
-  console.log(`  GET /healthz, /proxies, /stats`);
+  console.log(`  GET /healthz`);
 });
 
 socksServer.listen(SOCKS_PORT, '0.0.0.0', () => {
