@@ -17,6 +17,15 @@ primary_region = "ams"
   [[services.ports]]
     port = 1080
 
+# UDP service for QUIC/HTTP-3
+[[services]]
+  protocol = "udp"
+  internal_port = 11000
+  processes = ["app"]
+
+  [[services.ports]]
+    port = 11000
+
 [[vm]]
   cpu_kind = "shared"
   cpus = 1
