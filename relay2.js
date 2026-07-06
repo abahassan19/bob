@@ -1,12 +1,16 @@
-// relay.js — SOCKS5 on 1080, WebSocket on 10000
+// relay.js — SOCKS5 on 1080, WebSocket on 10000, UDP/QUIC on one port
 const net = require('net');
 const http = require('http');
 const WebSocket = require('ws');
 const fs = require('fs');
+const dgram = require('dgram');
+const dns = require('dns');
 const { checkAccess, syncUsage, syncProxyUsage } = require('./auth');
 
 const HTTP_PORT = parseInt(process.env.HTTP_PORT || '10000');
 const SOCKS_PORT = parseInt(process.env.SOCKS_PORT || '1080');
+const UDP_PORT = parseInt(process.env.UDP_PORT || '11000');
+const UDP_HOST = process.env.UDP_HOST || (process.env.FLY_APP_NAME ? 'fly-global-services' : '0.0.0.0');
 
 process.on('uncaughtException', (err) => {
   console.error('Uncaught:', err.message);
@@ -16,17 +20,271 @@ process.on('unhandledRejection', (reason) => {
 });
 
 // ─── State ───────────────────────────────────────────────────────────────────
-const proxies = new Map(); // proxyId -> { ws, proxyId, connectedAt, lastSeen, ip, bytesRelayed, activeTunnels }
+const proxies = new Map();
 const usage = {};
 const proxyUsage = {};
 const activeBridges = new Map();
 const PIPE_TIMEOUT = 300000;
 let bridgeCounter = 0;
 
-// Pending SOCKS5 requests waiting for a proxy to come online
-const pendingRequests = new Map(); // proxyId -> Array of { clientSocket, host, port, accessCode, clientId, timer }
-const pendingAnyRequests = []; // Array of similar objects for "random" proxy requests
-const REQUEST_TIMEOUT = 30000; // 30 seconds
+const pendingRequests = new Map();
+const pendingAnyRequests = [];
+const REQUEST_TIMEOUT = 30000;
+
+// ─── UDP/QUIC State ──────────────────────────────────────────────────────────
+// Sessions keyed by "clientIp:clientPort"
+const udpSessions = new Map();
+// Associations keyed by TCP clientSocket
+const udpAssociations = new Map();
+let udpSocket = null; // single shared inbound listener on UDP_PORT
+
+// ─── UDP Session Class ───────────────────────────────────────────────────────
+class UdpSession {
+  constructor(clientKey, clientRinfo, proxyId, accessCode) {
+    this.clientKey = clientKey;
+    this.clientRinfo = clientRinfo;   // { address, port, family }
+    this.proxyId = proxyId;
+    this.accessCode = accessCode;
+    this.targetHost = null;
+    this.targetPort = null;
+    this.outSocket = null;     // dedicated outbound UDP socket for this session
+    this.bytesRelayed = 0;
+    this.proxyUsage = 0;
+    this.lastActivity = Date.now();
+    this.createdAt = Date.now();
+    this.alive = true;
+    this.idleTimer = null;
+
+    this.resetIdleTimer();
+    console.log(`UDP session create: ${clientKey} (${proxyId}:${accessCode})`);
+  }
+
+  resetIdleTimer() {
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      console.log(`UDP session idle timeout: ${this.clientKey}`);
+      this.close();
+    }, 300000); // 5 min idle = QUIC connection likely dead
+  }
+
+  setTarget(host, port) {
+    // If target changed, we need a new outbound socket
+    if (this.targetHost !== host || this.targetPort !== port) {
+      this.closeOutSocket();
+      this.targetHost = host;
+      this.targetPort = port;
+    }
+  }
+
+  ensureOutSocket() {
+    if (this.outSocket) return this.outSocket;
+    if (!this.targetHost || !this.targetPort) return null;
+
+    const sock = dgram.createSocket('udp4');
+    sock.session = this; // back-reference for cleanup
+
+    sock.on('error', (err) => {
+      console.error(`UDP out ${this.clientKey} -> ${this.targetHost}:${this.targetPort} err:`, err.message);
+      // Don't close the session — the error might be transient.
+      // The socket is now broken, so close it and next send will recreate.
+      try { sock.close(); } catch {}
+      if (this.outSocket === sock) this.outSocket = null;
+    });
+
+    sock.on('message', (resp) => {
+      // Response from target — send back to client wrapped in SOCKS5 UDP header
+      if (!this.alive) return;
+      this.lastActivity = Date.now();
+      this.resetIdleTimer();
+      this.bytesRelayed += resp.length;
+
+      sendUdpResponse(this, this.targetHost, this.targetPort, resp);
+    });
+
+    this.outSocket = sock;
+    return sock;
+  }
+
+  closeOutSocket() {
+    if (this.outSocket) {
+      try { this.outSocket.close(); } catch {}
+      this.outSocket = null;
+    }
+  }
+
+  close() {
+    if (!this.alive) return;
+    this.alive = false;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+
+    this.closeOutSocket();
+    udpSessions.delete(this.clientKey);
+
+    // Track usage
+    if (this.accessCode && this.proxyUsage > 0) {
+      usage[this.accessCode] = (usage[this.accessCode] || 0) + this.proxyUsage;
+    }
+
+    console.log(`UDP session close: ${this.clientKey} (${(this.bytesRelayed/1e6).toFixed(2)} MB)`);
+  }
+
+  forwardDatagram(payload, host, port) {
+    if (!this.alive) return;
+    this.lastActivity = Date.now();
+    this.resetIdleTimer();
+    this.setTarget(host, port);
+
+    const sock = this.ensureOutSocket();
+    if (!sock) return;
+
+    this.bytesRelayed += payload.length;
+    this.proxyUsage += payload.length;
+
+    sock.send(payload, 0, payload.length, port, host, (err) => {
+      if (err) {
+        console.error(`UDP send ${host}:${port} err:`, err.message);
+        // Socket is broken, close it so ensureOutSocket recreates next time
+        this.closeOutSocket();
+      }
+    });
+  }
+}
+
+// ─── UDP Listener — Single Port ──────────────────────────────────────────────
+function initUdpListener() {
+  udpSocket = dgram.createSocket({
+    type: 'udp4',
+    lookup: (host, opts, cb) => {
+      dns.lookup(host, opts, cb);
+    }
+  });
+
+  udpSocket.on('error', (err) => {
+    console.error('UDP socket error:', err.message);
+    setTimeout(initUdpListener, 5000);
+  });
+
+  udpSocket.on('message', (msg, rinfo) => {
+    const clientKey = `${rinfo.address}:${rinfo.port}`;
+    let session = udpSessions.get(clientKey);
+
+    if (!session) {
+      // No session — this client didn't do UDP ASSOCIATE first
+      console.log(`UDP drop (no ASSOCIATE): ${clientKey}`);
+      return;
+    }
+
+    // Connection migration: if the client's IP/port changes mid-session,
+    // update the key. This is key for QUIC's connection migration feature.
+    if (rinfo.address !== session.clientRinfo.address || rinfo.port !== session.clientRinfo.port) {
+      const oldKey = session.clientKey;
+      session.clientKey = clientKey;
+      session.clientRinfo = rinfo;
+      udpSessions.delete(oldKey);
+      udpSessions.set(clientKey, session);
+      console.log(`UDP migration: ${oldKey} -> ${clientKey}`);
+    }
+
+    // Parse SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT + DATA
+    if (msg.length < 4) return;
+    if (msg[2] !== 0) {
+      console.warn(`UDP frag=${msg[2]} not supported, drop`);
+      return;
+    }
+
+    let host, port, off;
+    switch (msg[3]) {
+      case 0x01:
+        if (msg.length < 10) return;
+        host = `${msg[4]}.${msg[5]}.${msg[6]}.${msg[7]}`;
+        port = msg.readUInt16BE(8);
+        off = 10;
+        break;
+      case 0x03:
+        if (msg.length < 5) return;
+        const dl = msg[4];
+        if (msg.length < 5 + dl + 2) return;
+        host = msg.slice(5, 5 + dl).toString();
+        port = msg.readUInt16BE(5 + dl);
+        off = 7 + dl;
+        break;
+      case 0x04:
+        if (msg.length < 22) return;
+        const pts = [];
+        for (let i = 0; i < 8; i++) pts.push(msg.readUInt16BE(4 + i * 2).toString(16));
+        host = pts.join(':');
+        port = msg.readUInt16BE(20);
+        off = 22;
+        break;
+      default:
+        return;
+    }
+
+    const payload = msg.slice(off);
+    session.forwardDatagram(payload, host, port);
+  });
+
+  // Resolve fly-global-services before binding
+  const bindHost = UDP_HOST;
+
+  const doBind = (addr) => {
+    udpSocket.bind(UDP_PORT, addr, () => {
+      const a = udpSocket.address();
+      try { udpSocket.setRecvBufferSize(262144); } catch {}
+      try { udpSocket.setSendBufferSize(262144); } catch {}
+      console.log(`UDP listening on ${a.address}:${a.port}`);
+    });
+  };
+
+  if (bindHost === 'fly-global-services') {
+    // Resolve fly-global-services to an IP
+    dns.lookup('fly-global-services', { family: 4 }, (err, addr) => {
+      if (err) {
+        console.error('Failed to resolve fly-global-services, using 0.0.0.0:', err.message);
+        doBind('0.0.0.0');
+      } else {
+        console.log(`Resolved fly-global-services -> ${addr}`);
+        doBind(addr);
+      }
+    });
+  } else {
+    doBind(bindHost);
+  }
+}
+
+function sendUdpResponse(session, host, port, payload) {
+  if (!session.alive || !udpSocket) return;
+
+  // Build SOCKS5 UDP response header
+  const ip = host.split('.').map(Number);
+  let header;
+
+  if (ip.length === 4 && ip.every(x => !isNaN(x) && x >= 0 && x <= 255)) {
+    header = Buffer.alloc(10);
+    header[0] = 0; header[1] = 0;
+    header[2] = 0;
+    header[3] = 0x01;
+    header.writeUInt8(ip[0], 4);
+    header.writeUInt8(ip[1], 5);
+    header.writeUInt8(ip[2], 6);
+    header.writeUInt8(ip[3], 7);
+    header.writeUInt16BE(port, 8);
+  } else {
+    const d = Buffer.from(host);
+    header = Buffer.alloc(4 + 1 + d.length + 2);
+    header[0] = 0; header[1] = 0;
+    header[2] = 0;
+    header[3] = 0x03;
+    header[4] = d.length;
+    d.copy(header, 5);
+    header.writeUInt16BE(port, 5 + d.length);
+  }
+
+  const packet = Buffer.concat([header, payload]);
+  udpSocket.send(packet, 0, packet.length, session.clientRinfo.port, session.clientRinfo.address, (err) => {
+    if (err) console.error(`UDP resp send to ${session.clientKey}:`, err.message);
+  });
+}
 
 // ─── Proxy Health ────────────────────────────────────────────────────────────
 function updateProxySeen(proxyId) {
@@ -37,7 +295,7 @@ function updateProxySeen(proxyId) {
 function getProxyHealth() {
   const now = Date.now();
   const list = {};
-  for (const [id, p] of proxies) {
+  for (const [id, p] of proxies)
     list[id] = {
       connected: p.ws && p.ws.readyState === WebSocket.OPEN,
       uptime: Math.floor((now - p.connectedAt) / 1000),
@@ -46,7 +304,11 @@ function getProxyHealth() {
       bytesRelayed: p.bytesRelayed,
       activeTunnels: p.activeTunnels || 0
     };
-  }
+  list._udp = {
+    sessions: udpSessions.size,
+    port: UDP_PORT,
+    host: UDP_HOST
+  };
   return list;
 }
 
@@ -57,82 +319,49 @@ function saveProxyList() {
 }
 
 // ─── Proxy picker with waiting support ─────────────────────────────────────
-// Returns: { found: true, proxyId, proxyEntry } or { found: false, canWait: true/false }
 function pickProxy(proxyId) {
-  // If "random", we try to find any online proxy
   if (proxyId === 'random') {
-    const available = [...proxies.entries()].filter(([_, p]) =>
-      p.ws && p.ws.readyState === WebSocket.OPEN
-    );
+    const available = [...proxies.entries()].filter(([_, p]) => p.ws && p.ws.readyState === WebSocket.OPEN);
     if (available.length) {
-      // Pick a random one
       const idx = Math.floor(Math.random() * available.length);
       const [id, entry] = available[idx];
       return { found: true, proxyId: id, proxyEntry: entry };
     }
-    // No online proxy – we can wait for any to come online
     return { found: false, canWait: true, isRandom: true };
   }
-
-  // Specific proxy
   const p = proxies.get(proxyId);
-  if (p && p.ws && p.ws.readyState === WebSocket.OPEN) {
-    return { found: true, proxyId, proxyEntry: p };
-  }
-
-  // Proxy may be registered but offline – we can wait for it
-  if (proxies.has(proxyId)) {
-    return { found: false, canWait: true, isRandom: false };
-  }
-
-  // Proxy never registered – cannot wait
+  if (p && p.ws && p.ws.readyState === WebSocket.OPEN) return { found: true, proxyId, proxyEntry: p };
+  if (proxies.has(proxyId)) return { found: false, canWait: true, isRandom: false };
   return { found: false, canWait: false };
 }
 
-// ─── Process pending requests for a proxy that just came online ────────────
 function processPendingForProxy(proxyId, proxyEntry) {
   const list = pendingRequests.get(proxyId) || [];
-  if (list.length === 0) return;
-
-  // We'll take the first pending and process it
-  // We'll process one at a time (FIFO) to avoid overloading the proxy
+  if (!list.length) return;
   const req = list.shift();
-  if (list.length === 0) pendingRequests.delete(proxyId);
-
-  // Clear the timer
+  if (!list.length) pendingRequests.delete(proxyId);
   if (req.timer) clearTimeout(req.timer);
-
-  // Now we can proceed with the connection
   proceedWithConnection(req.clientSocket, proxyId, proxyEntry, req.clientId, req.host, req.port, req.accessCode);
 }
 
-// Process any pending "random" requests with the newly connected proxy
 function processPendingAny(proxyId, proxyEntry) {
-  if (pendingAnyRequests.length === 0) return;
+  if (!pendingAnyRequests.length) return;
   const req = pendingAnyRequests.shift();
   if (req.timer) clearTimeout(req.timer);
   proceedWithConnection(req.clientSocket, proxyId, proxyEntry, req.clientId, req.host, req.port, req.accessCode);
 }
 
-// ─── Actually send SOCKS5 reply and create bridge ─────────────────────────
 function proceedWithConnection(clientSocket, proxyId, proxyEntry, clientId, host, port, accessCode) {
-  // Send SOCKS5 success reply
   const r = Buffer.alloc(10);
   r[0] = 0x05; r[1] = 0x00; r[2] = 0x00; r[3] = 0x01;
   r.writeUInt32BE(0x7F000001, 4);
   r.writeUInt16BE(0, 8);
   clientSocket.write(r);
-
-  const bridgeId = createBridge(
-    clientSocket,
-    { ...proxyEntry, proxyId },
-    clientId, host, port, accessCode
-  );
-
+  const bridgeId = createBridge(clientSocket, { ...proxyEntry, proxyId }, clientId, host, port, accessCode);
   console.log(`Tunnel: ${proxyId}/${accessCode} -> ${host}:${port} [bridge#${bridgeId}]`);
 }
 
-// ─── Bridge (unchanged) ────────────────────────────────────────────────────
+// ─── Bridge ──────────────────────────────────────────────────────────────────
 function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode) {
   const proxyWs = proxyEntry.ws;
   const proxyId = proxyEntry.proxyId;
@@ -144,13 +373,7 @@ function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode
   proxyEntry.activeTunnels = (proxyEntry.activeTunnels || 0) + 1;
   if (!usage[accessCode]) usage[accessCode] = 0;
 
-  proxyWs.send(JSON.stringify({
-    type: 'pipe',
-    clientId,
-    targetHost: host,
-    targetPort: port,
-    accessCode
-  }));
+  proxyWs.send(JSON.stringify({ type: 'pipe', clientId, targetHost: host, targetPort: port, accessCode }));
 
   const proxyHandler = (data) => {
     if (!alive) return;
@@ -162,9 +385,7 @@ function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode
       proxyUsage[proxyId] = (proxyUsage[proxyId] || 0) + buf.length;
       const p = proxies.get(proxyId);
       if (p) { p.bytesRelayed = (p.bytesRelayed || 0) + buf.length; updateProxySeen(proxyId); }
-      if (clientSocket.writable) {
-        try { clientSocket.write(buf); } catch {}
-      }
+      if (clientSocket.writable) try { clientSocket.write(buf); } catch {}
     }
   };
 
@@ -174,9 +395,8 @@ function createBridge(clientSocket, proxyEntry, clientId, host, port, accessCode
     proxyUsage[proxyId] = (proxyUsage[proxyId] || 0) + data.length;
     const p = proxies.get(proxyId);
     if (p) p.bytesRelayed = (p.bytesRelayed || 0) + data.length;
-    if (proxyWs.readyState === WebSocket.OPEN) {
+    if (proxyWs.readyState === WebSocket.OPEN)
       proxyWs.send(JSON.stringify({ type: 'pipe_data', clientId, data: data.toString('base64') }));
-    }
   };
 
   proxyWs.on('message', proxyHandler);
@@ -216,26 +436,18 @@ const socksServer = net.createServer((clientSocket) => {
   let proxyId = null;
   let accessCode = null;
 
-  const die = () => {
-    if (dead) return; dead = true;
-    try { clientSocket.destroy(); } catch {}
-  };
-
+  const die = () => { if (dead) return; dead = true; try { clientSocket.destroy(); } catch {} };
   clientSocket.on('error', die);
 
-  // Phase 1: Greeting
   clientSocket.once('data', (buf) => {
-    if (buf.length < 2 || buf[0] !== 0x05) { console.log('Not SOCKS5, closing'); die(); return; }
-
+    if (buf.length < 2 || buf[0] !== 0x05) { die(); return; }
     const nmethods = buf[1];
     if (buf.length < 2 + nmethods) { die(); return; }
-
     const methods = [];
     for (let i = 0; i < nmethods; i++) methods.push(buf[2 + i]);
 
     if (methods.includes(0x02)) {
       clientSocket.write(Buffer.from([0x05, 0x02]));
-
       clientSocket.once('data', (ab) => {
         if (ab.length < 2 || ab[0] !== 0x01) { die(); return; }
         const ulen = ab[1];
@@ -248,7 +460,6 @@ const socksServer = net.createServer((clientSocket) => {
         console.log(`SOCKS5 auth: ${proxyId}:${accessCode}`);
         doConnect();
       });
-
     } else if (methods.includes(0x00)) {
       proxyId = 'default';
       accessCode = 'default';
@@ -262,10 +473,106 @@ const socksServer = net.createServer((clientSocket) => {
 
   function doConnect() {
     clientSocket.once('data', (buf) => {
-      if (buf.length < 4 || buf[0] !== 0x05 || buf[1] !== 0x01) { die(); return; }
+      if (buf.length < 4 || buf[0] !== 0x05) { die(); return; }
+
+      // ─── UDP ASSOCIATE (CMD=0x03) ───────────────────────────────────────
+      if (buf[1] === 0x03) {
+        let dstAddr, dstPort;
+        switch (buf[3]) {
+          case 0x01:
+            if (buf.length < 10) { sendSocksError(clientSocket, 0x01); die(); return; }
+            dstAddr = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
+            dstPort = buf.readUInt16BE(8);
+            break;
+          case 0x03:
+            if (buf.length < 5) { sendSocksError(clientSocket, 0x01); die(); return; }
+            const dl = buf[4];
+            if (buf.length < 5 + dl + 2) { sendSocksError(clientSocket, 0x01); die(); return; }
+            dstAddr = buf.slice(5, 5 + dl).toString();
+            dstPort = buf.readUInt16BE(5 + dl);
+            break;
+          case 0x04:
+            if (buf.length < 22) { sendSocksError(clientSocket, 0x01); die(); return; }
+            const pts = [];
+            for (let i = 0; i < 8; i++) pts.push(buf.readUInt16BE(4 + i * 2).toString(16));
+            dstAddr = pts.join(':');
+            dstPort = buf.readUInt16BE(20);
+            break;
+          default:
+            sendSocksError(clientSocket, 0x01);
+            die();
+            return;
+        }
+
+        if (!checkAccess(accessCode, 0, proxyId)) {
+          sendSocksError(clientSocket, 0x02);
+          die();
+          return;
+        }
+
+        if (!udpSocket) {
+          console.log('UDP socket not ready');
+          sendSocksError(clientSocket, 0x01);
+          die();
+          return;
+        }
+
+        const clientAddr = clientSocket.remoteAddress || '127.0.0.1';
+
+        // Store association (no session yet — created on first UDP datagram)
+        udpAssociations.set(clientSocket, {
+          proxyId,
+          accessCode,
+          clientAddr,
+          createdAt: Date.now()
+        });
+
+        // Reply with the relay's UDP endpoint
+        const udpAddr = udpSocket.address();
+        const replyIP = udpAddr.address;
+        const ip = replyIP.split('.').map(Number);
+
+        const reply = Buffer.alloc(10);
+        reply[0] = 0x05; reply[1] = 0x00; reply[2] = 0x00; reply[3] = 0x01;
+        reply.writeUInt8(ip[0] || 0, 4);
+        reply.writeUInt8(ip[1] || 0, 5);
+        reply.writeUInt8(ip[2] || 0, 6);
+        reply.writeUInt8(ip[3] || 0, 7);
+        reply.writeUInt16BE(udpAddr.port, 8);
+
+        try {
+          clientSocket.write(reply);
+          console.log(`UDP ASSOCIATE: ${proxyId}:${accessCode} -> ${replyIP}:${udpAddr.port} (client=${clientAddr})`);
+        } catch (e) {
+          udpAssociations.delete(clientSocket);
+          die();
+          return;
+        }
+
+        // When TCP control connection closes, clean up all UDP sessions for this client IP
+        clientSocket.on('close', () => {
+          const assoc = udpAssociations.get(clientSocket);
+          if (assoc) {
+            for (const [ck, ses] of udpSessions) {
+              if (ck.startsWith(assoc.clientAddr + ':')) {
+                ses.close();
+              }
+            }
+            udpAssociations.delete(clientSocket);
+          }
+        });
+
+        // First UDP datagram from this client will create the session.
+        // We set up the association so the UDP handler knows it's authorized.
+        console.log(`UDP ASSOCIATE pending for ${clientAddr} on port ${udpAddr.port}`);
+
+        return;
+      }
+
+      // ─── TCP CONNECT (CMD=0x01) ─────────────────────────────────────────
+      if (buf[1] !== 0x01) { die(); return; }
 
       let host, port;
-
       switch (buf[3]) {
         case 0x01:
           if (buf.length < 10) { die(); return; }
@@ -291,44 +598,30 @@ const socksServer = net.createServer((clientSocket) => {
       console.log(`SOCKS5 connect: ${proxyId}:${accessCode} -> ${host}:${port}`);
 
       if (!checkAccess(accessCode, 0, proxyId)) {
-        sendSocksError(clientSocket, 0x02); // connection not allowed
+        sendSocksError(clientSocket, 0x02);
         die();
         return;
       }
 
-      // Try to pick a proxy
       const pickResult = pickProxy(proxyId);
 
       if (pickResult.found) {
-        // Proxy is online, proceed immediately
         const clientId = `socks:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
         proceedWithConnection(clientSocket, pickResult.proxyId, pickResult.proxyEntry, clientId, host, port, accessCode);
         return;
       }
 
-      // Proxy not found – can we wait?
       if (!pickResult.canWait) {
-        // Proxy never registered – cannot wait, reject
         console.log(`Proxy ${proxyId} never registered, rejecting`);
-        sendSocksError(clientSocket, 0x04); // host unreachable
+        sendSocksError(clientSocket, 0x04);
         die();
         return;
       }
 
-      // We can wait for the proxy to come online
       const clientId = `socks:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
-      const request = {
-        clientSocket,
-        host,
-        port,
-        accessCode,
-        clientId,
-        timer: null
-      };
+      const request = { clientSocket, host, port, accessCode, clientId, timer: null };
 
-      // Set a timeout to reject if proxy doesn't come back
       const timer = setTimeout(() => {
-        // Remove from queue
         if (pickResult.isRandom) {
           const idx = pendingAnyRequests.indexOf(request);
           if (idx !== -1) pendingAnyRequests.splice(idx, 1);
@@ -338,35 +631,27 @@ const socksServer = net.createServer((clientSocket) => {
           if (idx !== -1) list.splice(idx, 1);
           if (list.length === 0) pendingRequests.delete(proxyId);
         }
-        // Send SOCKS5 error and close
         console.log(`Timeout waiting for proxy ${proxyId} (${accessCode} -> ${host}:${port})`);
-        sendSocksError(clientSocket, 0x04); // host unreachable
+        sendSocksError(clientSocket, 0x04);
         die();
       }, REQUEST_TIMEOUT);
       request.timer = timer;
 
-      // Store in appropriate queue
       if (pickResult.isRandom) {
         pendingAnyRequests.push(request);
-        console.log(`Queued random request for ${host}:${port} (waiting for any proxy)`);
+        console.log(`Queued random request for ${host}:${port}`);
       } else {
         if (!pendingRequests.has(proxyId)) pendingRequests.set(proxyId, []);
         pendingRequests.get(proxyId).push(request);
         console.log(`Queued request for proxy ${proxyId} (${host}:${port})`);
       }
-
-      // Do NOT send SOCKS5 reply yet – client will wait
     });
   }
 });
 
-// Helper to send SOCKS5 error reply
 function sendSocksError(socket, code) {
   const r = Buffer.alloc(10);
-  r[0] = 0x05;
-  r[1] = code; // 0x02 = not allowed, 0x04 = host unreachable, etc.
-  r[2] = 0x00;
-  r[3] = 0x01;
+  r[0] = 0x05; r[1] = code; r[2] = 0x00; r[3] = 0x01;
   r.writeUInt32BE(0, 4);
   r.writeUInt16BE(0, 8);
   try { socket.write(r); } catch {}
@@ -379,14 +664,12 @@ const httpServer = http.createServer((req, res) => {
     res.end('OK');
     return;
   }
-
   if (req.url === '/proxies1234567890') {
     const data = getProxyHealth();
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
     return;
   }
-
   res.writeHead(404);
   res.end();
 });
@@ -399,49 +682,28 @@ wss.on('connection', (ws, req) => {
   ws.on('ping', () => { ws.pong(); });
 
   ws.on('pong', () => {
-    if (ws.role === 'proxy' && ws.proxyId) {
-      updateProxySeen(ws.proxyId);
-    }
+    if (ws.role === 'proxy' && ws.proxyId) updateProxySeen(ws.proxyId);
   });
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
-
-    if (ws.role === 'proxy' && ws.proxyId) {
-      updateProxySeen(ws.proxyId);
-    }
+    if (ws.role === 'proxy' && ws.proxyId) updateProxySeen(ws.proxyId);
 
     switch (msg.type) {
       case 'register_proxy':
         ws.role = 'proxy';
         ws.proxyId = msg.proxyId;
-
         const existing = proxies.get(msg.proxyId);
-        if (existing && existing.ws && existing.ws.readyState === WebSocket.OPEN) {
-          existing.ws.terminate();
-        }
-
-        proxies.set(msg.proxyId, {
-          ws,
-          proxyId: msg.proxyId,
-          connectedAt: Date.now(),
-          lastSeen: Date.now(),
-          ip: req.socket.remoteAddress || 'unknown',
-          bytesRelayed: 0,
-          activeTunnels: 0
-        });
-
+        if (existing && existing.ws && existing.ws.readyState === WebSocket.OPEN) existing.ws.terminate();
+        proxies.set(msg.proxyId, { ws, proxyId: msg.proxyId, connectedAt: Date.now(), lastSeen: Date.now(), ip: req.socket.remoteAddress || 'unknown', bytesRelayed: 0, activeTunnels: 0 });
         if (!proxyUsage[msg.proxyId]) proxyUsage[msg.proxyId] = 0;
         ws.send(JSON.stringify({ type: 'registered' }));
         console.log(`Proxy online: ${msg.proxyId} from ${req.socket.remoteAddress}`);
         saveProxyList();
-
-        // Process any pending requests for this proxy
-        const proxyEntry = proxies.get(msg.proxyId);
-        processPendingForProxy(msg.proxyId, proxyEntry);
-        // Also process one pending "any" request using this proxy
-        processPendingAny(msg.proxyId, proxyEntry);
+        const pe = proxies.get(msg.proxyId);
+        processPendingForProxy(msg.proxyId, pe);
+        processPendingAny(msg.proxyId, pe);
         break;
 
       case 'usage_update':
@@ -449,10 +711,7 @@ wss.on('connection', (ws, req) => {
         break;
 
       case 'ping':
-        if (ws.role === 'proxy' && ws.proxyId) {
-          updateProxySeen(ws.proxyId);
-          ws.send(JSON.stringify({ type: 'pong' }));
-        }
+        if (ws.role === 'proxy' && ws.proxyId) { updateProxySeen(ws.proxyId); ws.send(JSON.stringify({ type: 'pong' })); }
         break;
     }
   });
@@ -460,15 +719,10 @@ wss.on('connection', (ws, req) => {
   ws.on('close', () => {
     if (ws.role === 'proxy') {
       const p = proxies.get(ws.proxyId);
-      if (p) {
-        console.log(`Proxy offline: ${ws.proxyId} (relayed ${(p.bytesRelayed/1e6).toFixed(2)} MB, ${p.activeTunnels} tunnels)`);
-      }
+      if (p) console.log(`Proxy offline: ${ws.proxyId} (relayed ${(p.bytesRelayed/1e6).toFixed(2)} MB, ${p.activeTunnels} tunnels)`);
       proxies.delete(ws.proxyId);
       delete proxyUsage[ws.proxyId];
       saveProxyList();
-
-      // Optionally, we could keep pending requests for this proxy – they will timeout
-      // We could also remove them immediately to free resources, but we'll let timeout handle
     }
   });
 });
@@ -477,19 +731,28 @@ wss.on('connection', (ws, req) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, p] of proxies) {
-    if (now - p.lastSeen > 120000) {
-      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-        console.log(`Proxy ${id} stale (lastSeen ${now - p.lastSeen}ms ago), terminating`);
-        p.ws.terminate();
-      }
+    if (now - p.lastSeen > 120000 && p.ws && p.ws.readyState === WebSocket.OPEN) {
+      console.log(`Proxy ${id} stale, terminating`);
+      p.ws.terminate();
+    }
+  }
+
+  // Clean up UDP sessions that have been idle too long (belt + suspenders)
+  for (const [ck, ses] of udpSessions) {
+    if (now - ses.lastActivity > 300000) {
+      console.log(`UDP session stale cleanup: ${ck}`);
+      ses.close();
     }
   }
 
   const online = [...proxies.values()].filter(p => p.ws && p.ws.readyState === WebSocket.OPEN).length;
-  console.log(`\n[Status] Proxies:${proxies.size}(online:${online}) Bridges:${activeBridges.size} Pending:${pendingRequests.size + pendingAnyRequests.length}`);
+  console.log(`\n[Status] Proxies:${proxies.size}(online:${online}) Bridges:${activeBridges.size} Pending:${pendingRequests.size + pendingAnyRequests.length} UDP sessions:${udpSessions.size}`);
   for (const [id, p] of proxies) {
     const alive = p.ws && p.ws.readyState === WebSocket.OPEN;
     console.log(`  ${alive ? '●' : '○'} ${id} | ${Math.floor((now - p.lastSeen)/1000)}s idle | ${p.activeTunnels || 0} tunnels | ${(p.bytesRelayed/1e6).toFixed(2)} MB`);
+  }
+  for (const [ck, ses] of udpSessions) {
+    console.log(`  UDP ${ck} -> ${ses.targetHost || '?'}:${ses.targetPort || '?'} ${(ses.bytesRelayed/1e6).toFixed(2)} MB`);
   }
 
   (async () => {
@@ -499,12 +762,10 @@ setInterval(() => {
       if (!checkAccess(code, 0, null, true)) invalid.push(code);
     }
     for (const code of invalid) { console.log(`Auth revoked: ${code}`); delete usage[code]; }
-    for (const [code, bytes] of Object.entries(usage)) {
+    for (const [code, bytes] of Object.entries(usage))
       if (bytes > 0) { await syncUsage(code, bytes); usage[code] = 0; }
-    }
-    for (const [pid, bytes] of Object.entries(proxyUsage)) {
+    for (const [pid, bytes] of Object.entries(proxyUsage))
       if (bytes > 0) { await syncProxyUsage(pid, bytes); proxyUsage[pid] = 0; }
-    }
   })();
 }, 30000);
 
@@ -520,3 +781,5 @@ socksServer.listen(SOCKS_PORT, '0.0.0.0', () => {
   console.log(`  curl --socks5 host:${SOCKS_PORT} -U proxyid:accesscode https://example.com`);
   console.log(`  Use username "random" to pick any available proxy`);
 });
+
+initUdpListener();
