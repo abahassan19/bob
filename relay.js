@@ -670,17 +670,15 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
     return;
   }
-  // NEW: Raw proxy list in one-per-line format
+  // NEW: Raw proxy list in one-per-line format with hardcoded IP 37.16.16.235
   if (req.url === '/proxyraw1234567890') {
     const password = 'proxysell-infinite-access-code';
-    // Get the public hostname from the request's Host header
-    const hostHeader = req.headers.host || 'localhost';
-    const hostname = hostHeader.split(':')[0]; // strip port if present
-    const socksPort = SOCKS_PORT; // 1080
+    const ip = '37.16.16.235';
+    const port = SOCKS_PORT; // 1080
     const lines = [];
     for (const [id, p] of proxies) {
       if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-        lines.push(`socks5://${id}:${password}@${hostname}:${socksPort}`);
+        lines.push(`socks5://${id}:${password}@${ip}:${port}`);
       }
     }
     res.writeHead(200, { 'Content-Type': 'text/plain' });
