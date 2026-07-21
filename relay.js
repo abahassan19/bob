@@ -32,29 +32,26 @@ const pendingAnyRequests = [];
 const REQUEST_TIMEOUT = 30000;
 
 // ─── UDP/QUIC State ──────────────────────────────────────────────────────────
-// Sessions keyed by "clientIp:clientPort"
 const udpSessions = new Map();
-// Associations keyed by TCP clientSocket
 const udpAssociations = new Map();
-let udpSocket = null; // single shared inbound listener on UDP_PORT
+let udpSocket = null;
 
 // ─── UDP Session Class ───────────────────────────────────────────────────────
 class UdpSession {
   constructor(clientKey, clientRinfo, proxyId, accessCode) {
     this.clientKey = clientKey;
-    this.clientRinfo = clientRinfo;   // { address, port, family }
+    this.clientRinfo = clientRinfo;
     this.proxyId = proxyId;
     this.accessCode = accessCode;
     this.targetHost = null;
     this.targetPort = null;
-    this.outSocket = null;     // dedicated outbound UDP socket for this session
+    this.outSocket = null;
     this.bytesRelayed = 0;
     this.proxyUsage = 0;
     this.lastActivity = Date.now();
     this.createdAt = Date.now();
     this.alive = true;
     this.idleTimer = null;
-
     this.resetIdleTimer();
     console.log(`UDP session create: ${clientKey} (${proxyId}:${accessCode})`);
   }
@@ -64,11 +61,10 @@ class UdpSession {
     this.idleTimer = setTimeout(() => {
       console.log(`UDP session idle timeout: ${this.clientKey}`);
       this.close();
-    }, 300000); // 5 min idle = QUIC connection likely dead
+    }, 300000);
   }
 
   setTarget(host, port) {
-    // If target changed, we need a new outbound socket
     if (this.targetHost !== host || this.targetPort !== port) {
       this.closeOutSocket();
       this.targetHost = host;
@@ -79,28 +75,20 @@ class UdpSession {
   ensureOutSocket() {
     if (this.outSocket) return this.outSocket;
     if (!this.targetHost || !this.targetPort) return null;
-
     const sock = dgram.createSocket('udp4');
-    sock.session = this; // back-reference for cleanup
-
+    sock.session = this;
     sock.on('error', (err) => {
       console.error(`UDP out ${this.clientKey} -> ${this.targetHost}:${this.targetPort} err:`, err.message);
-      // Don't close the session — the error might be transient.
-      // The socket is now broken, so close it and next send will recreate.
       try { sock.close(); } catch {}
       if (this.outSocket === sock) this.outSocket = null;
     });
-
     sock.on('message', (resp) => {
-      // Response from target — send back to client wrapped in SOCKS5 UDP header
       if (!this.alive) return;
       this.lastActivity = Date.now();
       this.resetIdleTimer();
       this.bytesRelayed += resp.length;
-
       sendUdpResponse(this, this.targetHost, this.targetPort, resp);
     });
-
     this.outSocket = sock;
     return sock;
   }
@@ -116,15 +104,11 @@ class UdpSession {
     if (!this.alive) return;
     this.alive = false;
     if (this.idleTimer) clearTimeout(this.idleTimer);
-
     this.closeOutSocket();
     udpSessions.delete(this.clientKey);
-
-    // Track usage
     if (this.accessCode && this.proxyUsage > 0) {
       usage[this.accessCode] = (usage[this.accessCode] || 0) + this.proxyUsage;
     }
-
     console.log(`UDP session close: ${this.clientKey} (${(this.bytesRelayed/1e6).toFixed(2)} MB)`);
   }
 
@@ -133,24 +117,20 @@ class UdpSession {
     this.lastActivity = Date.now();
     this.resetIdleTimer();
     this.setTarget(host, port);
-
     const sock = this.ensureOutSocket();
     if (!sock) return;
-
     this.bytesRelayed += payload.length;
     this.proxyUsage += payload.length;
-
     sock.send(payload, 0, payload.length, port, host, (err) => {
       if (err) {
         console.error(`UDP send ${host}:${port} err:`, err.message);
-        // Socket is broken, close it so ensureOutSocket recreates next time
         this.closeOutSocket();
       }
     });
   }
 }
 
-// ─── UDP Listener — Single Port ──────────────────────────────────────────────
+// ─── UDP Listener ──────────────────────────────────────────────────────────────
 function initUdpListener() {
   udpSocket = dgram.createSocket({
     type: 'udp4',
@@ -167,15 +147,10 @@ function initUdpListener() {
   udpSocket.on('message', (msg, rinfo) => {
     const clientKey = `${rinfo.address}:${rinfo.port}`;
     let session = udpSessions.get(clientKey);
-
     if (!session) {
-      // No session — this client didn't do UDP ASSOCIATE first
       console.log(`UDP drop (no ASSOCIATE): ${clientKey}`);
       return;
     }
-
-    // Connection migration: if the client's IP/port changes mid-session,
-    // update the key. This is key for QUIC's connection migration feature.
     if (rinfo.address !== session.clientRinfo.address || rinfo.port !== session.clientRinfo.port) {
       const oldKey = session.clientKey;
       session.clientKey = clientKey;
@@ -184,14 +159,11 @@ function initUdpListener() {
       udpSessions.set(clientKey, session);
       console.log(`UDP migration: ${oldKey} -> ${clientKey}`);
     }
-
-    // Parse SOCKS5 UDP request header: RSV(2) + FRAG(1) + ATYP(1) + DST.ADDR + DST.PORT + DATA
     if (msg.length < 4) return;
     if (msg[2] !== 0) {
       console.warn(`UDP frag=${msg[2]} not supported, drop`);
       return;
     }
-
     let host, port, off;
     switch (msg[3]) {
       case 0x01:
@@ -219,14 +191,11 @@ function initUdpListener() {
       default:
         return;
     }
-
     const payload = msg.slice(off);
     session.forwardDatagram(payload, host, port);
   });
 
-  // Resolve fly-global-services before binding
   const bindHost = UDP_HOST;
-
   const doBind = (addr) => {
     udpSocket.bind(UDP_PORT, addr, () => {
       const a = udpSocket.address();
@@ -235,9 +204,7 @@ function initUdpListener() {
       console.log(`UDP listening on ${a.address}:${a.port}`);
     });
   };
-
   if (bindHost === 'fly-global-services') {
-    // Resolve fly-global-services to an IP
     dns.lookup('fly-global-services', { family: 4 }, (err, addr) => {
       if (err) {
         console.error('Failed to resolve fly-global-services, using 0.0.0.0:', err.message);
@@ -254,11 +221,8 @@ function initUdpListener() {
 
 function sendUdpResponse(session, host, port, payload) {
   if (!session.alive || !udpSocket) return;
-
-  // Build SOCKS5 UDP response header
   const ip = host.split('.').map(Number);
   let header;
-
   if (ip.length === 4 && ip.every(x => !isNaN(x) && x >= 0 && x <= 255)) {
     header = Buffer.alloc(10);
     header[0] = 0; header[1] = 0;
@@ -279,7 +243,6 @@ function sendUdpResponse(session, host, port, payload) {
     d.copy(header, 5);
     header.writeUInt16BE(port, 5 + d.length);
   }
-
   const packet = Buffer.concat([header, payload]);
   udpSocket.send(packet, 0, packet.length, session.clientRinfo.port, session.clientRinfo.address, (err) => {
     if (err) console.error(`UDP resp send to ${session.clientKey}:`, err.message);
@@ -318,7 +281,7 @@ function saveProxyList() {
   fs.writeFileSync('proxies.json', JSON.stringify(list, null, 2), 'utf8');
 }
 
-// ─── Proxy picker with waiting support ─────────────────────────────────────
+// ─── Proxy picker ─────────────────────────────────────────────────────────────
 function pickProxy(proxyId) {
   if (proxyId === 'random') {
     const available = [...proxies.entries()].filter(([_, p]) => p.ws && p.ws.readyState === WebSocket.OPEN);
@@ -475,7 +438,6 @@ const socksServer = net.createServer((clientSocket) => {
     clientSocket.once('data', (buf) => {
       if (buf.length < 4 || buf[0] !== 0x05) { die(); return; }
 
-      // ─── UDP ASSOCIATE (CMD=0x03) ───────────────────────────────────────
       if (buf[1] === 0x03) {
         let dstAddr, dstPort;
         switch (buf[3]) {
@@ -518,8 +480,6 @@ const socksServer = net.createServer((clientSocket) => {
         }
 
         const clientAddr = clientSocket.remoteAddress || '127.0.0.1';
-
-        // Store association (no session yet — created on first UDP datagram)
         udpAssociations.set(clientSocket, {
           proxyId,
           accessCode,
@@ -527,7 +487,6 @@ const socksServer = net.createServer((clientSocket) => {
           createdAt: Date.now()
         });
 
-        // Reply with the relay's UDP endpoint
         const udpAddr = udpSocket.address();
         const replyIP = udpAddr.address;
         const ip = replyIP.split('.').map(Number);
@@ -549,7 +508,6 @@ const socksServer = net.createServer((clientSocket) => {
           return;
         }
 
-        // When TCP control connection closes, clean up all UDP sessions for this client IP
         clientSocket.on('close', () => {
           const assoc = udpAssociations.get(clientSocket);
           if (assoc) {
@@ -562,14 +520,10 @@ const socksServer = net.createServer((clientSocket) => {
           }
         });
 
-        // First UDP datagram from this client will create the session.
-        // We set up the association so the UDP handler knows it's authorized.
         console.log(`UDP ASSOCIATE pending for ${clientAddr} on port ${udpAddr.port}`);
-
         return;
       }
 
-      // ─── TCP CONNECT (CMD=0x01) ─────────────────────────────────────────
       if (buf[1] !== 0x01) { die(); return; }
 
       let host, port;
@@ -670,21 +624,56 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
     return;
   }
-  // NEW: Raw proxy list in one-per-line format with hardcoded IP 37.16.16.235
+  // ─── NEW: Raw proxy list from live JSON endpoint ──────────────────────────
   if (req.url === '/proxyraw1234567890') {
     const password = 'proxysell-infinite-access-code';
     const ip = '37.16.16.235';
-    const port = SOCKS_PORT; // 1080
-    const lines = [];
-    for (const [id, p] of proxies) {
-      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
-        lines.push(`socks5://${id}:${password}@${ip}:${port}`);
-      }
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(lines.join('\n'));
+    const port = SOCKS_PORT;
+
+    // Fetch the live JSON from the same server (internal)
+    const options = {
+      hostname: 'localhost',
+      port: HTTP_PORT,
+      path: '/proxies1234567890',
+      method: 'GET',
+      headers: { 'Host': req.headers.host } // pass the original host if needed
+    };
+
+    const proxyReq = http.request(options, (proxyRes) => {
+      let body = '';
+      proxyRes.on('data', (chunk) => body += chunk);
+      proxyRes.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          const lines = [];
+          // Iterate over each key in data.proxies, skip "_udp"
+          for (const [name, info] of Object.entries(data.proxies)) {
+            if (name === '_udp') continue;
+            // Only include proxies that are connected
+            if (info.connected) {
+              lines.push(`socks5://${name}:${password}@${ip}:${port}`);
+            }
+          }
+          res.writeHead(200, { 'Content-Type': 'text/plain' });
+          res.end(lines.join('\n'));
+        } catch (err) {
+          console.error('Error parsing JSON from /proxies1234567890:', err);
+          res.writeHead(500);
+          res.end('Internal Server Error');
+        }
+      });
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('Error fetching /proxies1234567890:', err);
+      res.writeHead(500);
+      res.end('Internal Server Error');
+    });
+
+    proxyReq.end();
     return;
   }
+
   res.writeHead(404);
   res.end();
 });
@@ -752,7 +741,6 @@ setInterval(() => {
     }
   }
 
-  // Clean up UDP sessions that have been idle too long (belt + suspenders)
   for (const [ck, ses] of udpSessions) {
     if (now - ses.lastActivity > 300000) {
       console.log(`UDP session stale cleanup: ${ck}`);
