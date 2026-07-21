@@ -624,56 +624,25 @@ const httpServer = http.createServer((req, res) => {
     res.end(JSON.stringify({ total: Object.keys(data).length, proxies: data }));
     return;
   }
-  // ─── NEW: Raw proxy list from live JSON endpoint ──────────────────────────
+  // ─── RAW PROXY LIST - DIRECT FROM MEMORY ──────────────────────────────
   if (req.url === '/proxyraw1234567890') {
     const password = 'proxysell-infinite-access-code';
     const ip = '37.16.16.235';
     const port = SOCKS_PORT;
+    const lines = [];
 
-    // Fetch the live JSON from the same server (internal)
-    const options = {
-      hostname: 'localhost',
-      port: HTTP_PORT,
-      path: '/proxies1234567890',
-      method: 'GET',
-      headers: { 'Host': req.headers.host } // pass the original host if needed
-    };
+    // Loop through all proxies in memory
+    for (const [id, p] of proxies) {
+      // Only include connected proxies
+      if (p.ws && p.ws.readyState === WebSocket.OPEN) {
+        lines.push(`socks5://${id}:${password}@${ip}:${port}`);
+      }
+    }
 
-    const proxyReq = http.request(options, (proxyRes) => {
-      let body = '';
-      proxyRes.on('data', (chunk) => body += chunk);
-      proxyRes.on('end', () => {
-        try {
-          const data = JSON.parse(body);
-          const lines = [];
-          // Iterate over each key in data.proxies, skip "_udp"
-          for (const [name, info] of Object.entries(data.proxies)) {
-            if (name === '_udp') continue;
-            // Only include proxies that are connected
-            if (info.connected) {
-              lines.push(`socks5://${name}:${password}@${ip}:${port}`);
-            }
-          }
-          res.writeHead(200, { 'Content-Type': 'text/plain' });
-          res.end(lines.join('\n'));
-        } catch (err) {
-          console.error('Error parsing JSON from /proxies1234567890:', err);
-          res.writeHead(500);
-          res.end('Internal Server Error');
-        }
-      });
-    });
-
-    proxyReq.on('error', (err) => {
-      console.error('Error fetching /proxies1234567890:', err);
-      res.writeHead(500);
-      res.end('Internal Server Error');
-    });
-
-    proxyReq.end();
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(lines.join('\n'));
     return;
   }
-
   res.writeHead(404);
   res.end();
 });
